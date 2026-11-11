@@ -1,0 +1,35 @@
+# build
+/out/
+/build/
+*.zip
+*.pdb
+*.dll
+*.exe
+*.obj
+*.o
+
+# recompiled code, derived from the game
+/generated/
+
+# user's own game files
+/assets/
+
+# junction to ..\XboxXBERecomp
+/sdk
+
+# runtime files
+settings.toml
+/logs/
+/hdd/
+/CrashDumps/
+
+# python
+__pycache__/
+
+# editors
+.vs/
+.vscode/
+.idea/
+
+# Local temporary folder
+.local

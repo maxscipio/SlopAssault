@@ -1,0 +1,1958 @@
+diff --git a/runtime/app/app.h b/runtime/app/app.h
+index e1c1254..e8e719e 100644
+--- a/runtime/app/app.h
++++ b/runtime/app/app.h
+@@ -23,6 +23,7 @@ struct Settings {
+     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
+     bool vsync = true;
+     uint32_t aniso = 0;              // 0 as the game asks
++    bool shader_cache = true;        // compiled shaders and pipelines kept in <exe dir>/shader_cache for the next run
+     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
+     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
+     uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
+diff --git a/runtime/app/main.cpp b/runtime/app/main.cpp
+index e36f7ac..d58c1da 100644
+--- a/runtime/app/main.cpp
++++ b/runtime/app/main.cpp
+@@ -26,6 +26,7 @@
+ #include "kernel/kernel.h"
+ 
+ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
++void DumpAudio();  // xdk/dsound.cpp
+ 
+ namespace app {
+ 
+@@ -70,6 +71,8 @@ LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
+ 
+ void DumpThreads() {
+     gpu::g_capture = true;
++    DumpAudio();
++    kernel::DumpFiles();
+     for (auto& t : kernel::Threads())
+         if (t->ctx) {
+             LOGI("thread %X", t->id);
+diff --git a/runtime/app/settings.cpp b/runtime/app/settings.cpp
+index 075b3b7..3255811 100644
+--- a/runtime/app/settings.cpp
++++ b/runtime/app/settings.cpp
+@@ -50,6 +50,7 @@ void Load() {
+     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
+     s.vsync = t["vsync"].value_or(s.vsync);
+     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
++    s.shader_cache = t["shader_cache"].value_or(s.shader_cache);
+     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
+     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
+     s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
+@@ -72,6 +73,7 @@ toml::table Table() {
+                   {"fps_cap", int64_t(s.fps_cap)},
+                   {"vsync", s.vsync},
+                   {"anisotropic_filtering", int64_t(s.aniso)},
++                  {"shader_cache", s.shader_cache},
+                   {"custom_textures", s.custom_textures},
+                   {"dump_textures", s.dump_textures},
+                   {"texture_dump_format", int64_t(s.texture_dump_format)},
+diff --git a/runtime/core/log.cpp b/runtime/core/log.cpp
+index 7e6507d..2bb3502 100644
+--- a/runtime/core/log.cpp
++++ b/runtime/core/log.cpp
+@@ -52,7 +52,8 @@ void Init(const std::string& dir, const std::string& prefix, bool append) {
+ const std::string& Path() { return g_path; }
+ 
+ void Write(Level lv, const char* fmt, ...) {
+-    if (!kVerbose && lv < Level::Error) return;
++    static const bool all = std::getenv("XBE_LOG") != nullptr;  // release build: every level, flushed per line
++    if (!kVerbose && !all && lv < Level::Error) return;
+     char msg[4096];
+     va_list ap;
+     va_start(ap, fmt);
+@@ -68,7 +69,7 @@ void Write(Level lv, const char* fmt, ...) {
+     n = std::min(n, int(sizeof(line)) - 1);
+     if (g_file) {
+         std::fwrite(line, 1, size_t(n), g_file);
+-        if (lv >= Level::Warn) std::fflush(g_file);
++        if (kVerbose || all || lv >= Level::Warn) std::fflush(g_file);  // a debug log must survive a killed or hung process
+     }
+     std::fwrite(line, 1, size_t(n), stderr);
+ }
+diff --git a/runtime/cpu/dispatch.cpp b/runtime/cpu/dispatch.cpp
+index c810896..149b526 100644
+--- a/runtime/cpu/dispatch.cpp
++++ b/runtime/cpu/dispatch.cpp
+@@ -166,9 +166,23 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
+     x86_trap(ctx, ret, "indirect call to unknown code");
+ }
+ 
+-void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r) {
+-    ctx.esp = r.esp;
+-    dispatch::Find(r.target)(ctx, base);
++void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r, uint32_t frame) {
++    // The continuation runs here, inside the catch block of the frame that owns it, which a later throw cannot
++    // reach: a function that longjmps to the same setjmp again (the game does, to restart its main loop) would
++    // escape. The loop catches the next resume aimed at this frame.
++    X86Resume cur = r;
++    for (;;) {
++        try {
++            ctx.esp = cur.esp;
++            dispatch::Find(cur.target)(ctx, base);
++            return;
++        } catch (const X86Resume& next) {
++            if (next.esp >= frame) throw;
++            static std::atomic<int> logged{0};
++            if (logged++ < 8) LOGR("resume: another jump to the frame at %08X (target %08X)", frame, next.target);
++            cur = next;
++        }
++    }
+ }
+ 
+ void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal) {
+@@ -237,6 +251,17 @@ namespace kernel {
+ void LogGuestStack(X86Context& ctx, int words) {
+     LOGE("  eax %08X ecx %08X edx %08X ebx %08X esp %08X ebp %08X esi %08X edi %08X", ctx.eax, ctx.ecx, ctx.edx, ctx.ebx,
+          ctx.esp, ctx.ebp, ctx.esi, ctx.edi);
++    for (uint32_t reg : {ctx.esi, ctx.edi, ctx.ebx, ctx.ebp}) {
++        if (!mem::IsCommitted(reg) || !mem::IsCommitted(reg + 0x3C)) continue;
++        LOGE("  [%08X] %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X", reg, R32(reg), R32(reg + 4),
++             R32(reg + 8), R32(reg + 12), R32(reg + 16), R32(reg + 20), R32(reg + 24), R32(reg + 28), R32(reg + 32), R32(reg + 36),
++             R32(reg + 40), R32(reg + 44), R32(reg + 48), R32(reg + 52), R32(reg + 56), R32(reg + 60));
++        uint32_t vt = R32(reg);
++        if (mem::IsCommitted(vt) && mem::IsCommitted(vt + 0x40))
++            LOGE("   vtbl %08X: %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X", vt, R32(vt), R32(vt + 4),
++                 R32(vt + 8), R32(vt + 12), R32(vt + 16), R32(vt + 20), R32(vt + 24), R32(vt + 28), R32(vt + 32), R32(vt + 36),
++                 R32(vt + 40), R32(vt + 44), R32(vt + 48), R32(vt + 52), R32(vt + 56), R32(vt + 60));
++    }
+     for (int i = 0; i < words; i++) {
+         uint32_t a = ctx.esp + uint32_t(i) * 4;
+         if (!mem::IsCommitted(a)) break;
+diff --git a/runtime/cpu/x86_ops.h b/runtime/cpu/x86_ops.h
+index 09562e7..0cb9bf5 100644
+--- a/runtime/cpu/x86_ops.h
++++ b/runtime/cpu/x86_ops.h
+@@ -72,7 +72,7 @@ X86_HOST_API void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target);
+ struct X86Resume {
+     uint32_t target, esp;
+ };
+-X86_HOST_API void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r);
++X86_HOST_API void x86_resume(X86Context& ctx, uint8_t* base, const X86Resume& r, uint32_t frame);
+ X86_HOST_API void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal);
+ [[noreturn]] X86_HOST_API void x86_trap(X86Context& ctx, uint32_t va, const char* what);
+ X86_HOST_API void x86_priv(X86Context& ctx, uint32_t va, const char* what);
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index fe65837..beb6f02 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -340,6 +340,7 @@ struct Tex {
+     uint32_t levels = 1;
+     uint64_t sig = 0;
+     uint64_t frame = 0;
++    uint64_t dynamic_until = 0;  // frame up to which every bind re-checks the bytes: the title rewrote it recently
+     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
+     uint8_t flags = 0;  // Extension::Decoded's
+     const Tex* swap = nullptr;  // the texture pack's image drawn in its place
+@@ -615,7 +616,7 @@ private:
+     void ResizeSwap();
+     void UploadGammaRamp();
+     void DrawFrame(Target* t, uint32_t bi);
+-    void BlitFrame(Target& t);
++    void BlitFrame(Target& t, ID3D12Resource* shown, DXGI_FORMAT shown_fmt);
+     void RenderUi();
+     void ReleaseOldTextures();
+     void ResetFrame();
+@@ -726,7 +727,11 @@ private:
+     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> blobs_;
+     std::unordered_map<uint64_t, uint64_t> shader_src_;  // vertex and pixel program keys to source hash
+     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
+-    std::unordered_map<uint64_t, uint32_t> samplers_;
++    // on disk for the next run: compiled shaders, appended as they are made
++    std::filesystem::path shader_cache_;
++    uint32_t cache_shaders_ = 0;  // loaded from disk
++    void LoadShaderCache();
++    void SaveShader(uint64_t hash, ID3DBlob* code);    std::unordered_map<uint64_t, uint32_t> samplers_;
+     uint32_t smp_used_ = 0;
+     std::unordered_map<uint64_t, Target> targets_;
+     std::unordered_map<uint32_t, uint64_t> target_used_;  // target address to the frame it was last used
+@@ -817,6 +822,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
+     CreateHeaps();
+     CreateBackBufferViews();
+     if (!CreateRootSignature()) return false;
++    LoadShaderCache();
+     CreateFrames();
+     CreateGammaLut();
+     ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
+@@ -997,7 +1003,10 @@ void D3D12Backend::Submit(bool wait) {
+     }
+ }
+ 
+-void D3D12Backend::Flush() { Submit(true); }
++void D3D12Backend::Flush() {
++    Submit(true);
++    DeliverReports();
++}
+ 
+ void D3D12Backend::WaitFence(uint64_t value) {
+     fence_->SetEventOnCompletion(value, event_);
+@@ -1414,6 +1423,8 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
+     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over), cb.gpu, slot, si);
+ }
+ 
++constexpr UINT kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
++
+ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
+     // one source can hold several entry points
+     uint64_t profile_seed = Hash(profile, std::strlen(profile));
+@@ -1426,7 +1437,7 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
+     PerfScope perf_compile{g_perf.compile};
+     g_perf.shaders++;
+     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, profile,
+-                            D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
++                            kCompileFlags, 0, &code, &err);
+     if (FAILED(hr)) {
+         LOGE("d3d12: %s compile failed: %s", profile, err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+         LOGE("%s", src.c_str());
+@@ -1434,9 +1445,84 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
+         return nullptr;
+     }
+     blobs_[hash] = code;
++    SaveShader(hash, code.Get());
+     return code.Get();
+ }
+ 
++constexpr char kShaderCacheMagic[8] = {'X', 'B', 'R', 'S', 'H', 'D', '0', '1'};
++// a cache made with other compiler flags is dropped
++constexpr uint64_t kShaderCacheSalt = uint64_t(kCompileFlags) | 1ull << 32;
++
++struct ShaderRecord {
++    uint64_t hash;   // Compile's key
++    uint64_t check;  // of the code, against a torn write
++    uint32_t size;
++    uint32_t pad;
++};
++
++std::filesystem::path ShaderCacheDir() {
++    if (!app::Get().shader_cache) return {};
++    return app::ExeDir() / "shader_cache";
++}
++
++// reads the whole file at start (a few MB); a damaged tail is dropped and the file started again from what was good
++void D3D12Backend::LoadShaderCache() {
++    std::filesystem::path dir = ShaderCacheDir();
++    if (dir.empty()) return;
++    std::error_code ec;
++    std::filesystem::create_directories(dir, ec);
++    shader_cache_ = dir / "shaders.bin";
++    std::vector<uint8_t> data;
++    if (FILE* f = _wfopen(shader_cache_.c_str(), L"rb")) {
++        _fseeki64(f, 0, SEEK_END);
++        data.resize(size_t(_ftelli64(f)));
++        _fseeki64(f, 0, SEEK_SET);
++        if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
++        fclose(f);
++    }
++    constexpr size_t kHeader = sizeof(kShaderCacheMagic) + 8;
++    size_t at = kHeader, good = 0;
++    bool usable = data.size() >= at && !std::memcmp(data.data(), kShaderCacheMagic, sizeof(kShaderCacheMagic)) &&
++                  !std::memcmp(data.data() + sizeof(kShaderCacheMagic), &kShaderCacheSalt, 8);
++    if (usable) good = kHeader;
++    while (usable && data.size() - at >= sizeof(ShaderRecord)) {
++        ShaderRecord r;
++        std::memcpy(&r, data.data() + at, sizeof(r));
++        const uint8_t* code = data.data() + at + sizeof(r);
++        if (r.size > data.size() - at - sizeof(r) || Hash(code, r.size) != r.check) break;
++        ComPtr<ID3DBlob> blob;
++        if (FAILED(D3DCreateBlob(r.size, &blob))) break;
++        std::memcpy(blob->GetBufferPointer(), code, r.size);
++        blobs_[r.hash] = blob;
++        at += sizeof(r) + r.size;
++        good = at;
++        cache_shaders_++;
++    }
++    if (!usable || good != data.size()) {
++        if (FILE* f = _wfopen(shader_cache_.c_str(), L"wb")) {
++            fwrite(kShaderCacheMagic, 1, sizeof(kShaderCacheMagic), f);
++            fwrite(&kShaderCacheSalt, 1, 8, f);
++            if (good > kHeader) fwrite(data.data() + kHeader, 1, good - kHeader, f);
++            fclose(f);
++        }
++    }
++    LOGR("d3d12: shader cache: %u shaders from %s", cache_shaders_,
++         reinterpret_cast<const char*>(shader_cache_.u8string().c_str()));
++}
++
++// one append per shader, the file opened for it so a second copy of the game can share it
++void D3D12Backend::SaveShader(uint64_t hash, ID3DBlob* code) {
++    if (shader_cache_.empty()) return;
++    ShaderRecord r{hash, Hash(code->GetBufferPointer(), code->GetBufferSize()), uint32_t(code->GetBufferSize()), 0};
++    std::vector<uint8_t> rec(sizeof(r) + r.size);
++    std::memcpy(rec.data(), &r, sizeof(r));
++    std::memcpy(rec.data() + sizeof(r), code->GetBufferPointer(), r.size);
++    if (FILE* f = _wfopen(shader_cache_.c_str(), L"ab")) {
++        fwrite(rec.data(), 1, rec.size(), f);
++        fclose(f);
++    }
++}
++
+ // a full screen pass's pipeline: solid, no culling, one target, writing all channels; callers set the blend
+ D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps,
+                                                                         DXGI_FORMAT rtv) const {
+@@ -1855,8 +1941,9 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const
+     uint32_t total = TotalSize(d);
+     bool same = SameTexture(tx, d);
+     if (!same && !CreateTexture(tx, d, fi, key)) return nullptr;
+-    // cheap change check once per frame: lock epochs plus a sample of the bytes
+-    if (tx.frame != presents_ + 1 || !same || tx.palette != palette.hash) {
++    // cheap change check once per frame: lock epochs plus a sample of the bytes. A texture the title rewrites between
++    // draws (dynamic text) is checked at every bind, or all its draws in a frame would show the first contents.
++    if (tx.frame != presents_ + 1 || !same || tx.palette != palette.hash || presents_ < tx.dynamic_until) {
+         tx.frame = presents_ + 1;
+         tx.palette = palette.hash;
+         const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
+@@ -1864,6 +1951,7 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const
+         uint64_t sig = MemSig(d.data, total) ^ DirtyEpoch(d.data) ^ palette.hash;
+         g_perf.sig += PerfMs(perf_t);
+         if (sig != tx.sig || !same) {
++            if (same) tx.dynamic_until = presents_ + 120;
+             PerfScope perf_up{g_perf.texup};
+             g_perf.texups++;
+             g_perf.texup_bytes += total;
+@@ -2227,6 +2315,10 @@ void FillSurfaceConstants(const State& s, GuestExtent size, DrawConstants& c) {
+     c.misc[1] = SimpleState(s, kMAlphaTestEnable) ? float(Cmp(SimpleState(s, kMAlphaFunc)) - 1) : kAlphaTestAlways;
+     c.misc[2] = float(Cmp(s.rs[kRsShadowFunc]) - 1);
+     c.misc[3] = s.rs[kRsSpecularEnable] ? 1.0f : 0.0f;
++    c.ptsz[0] = s.rs[kRsPointSpriteEnable] ? 1.0f : 0.0f;
++    c.ptsz[1] = Bits(s.rs[kRsPointSize]);
++    c.ptsz[2] = Bits(s.rs[kRsPointSizeMin]);
++    c.ptsz[3] = Bits(s.rs[kRsPointSizeMax]);
+ }
+ 
+ void FillCombinerConstants(const State& s, DrawConstants& c) {
+@@ -2525,6 +2617,14 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
+ // small draws: their inputs and constants; then ends the draw's line
+ void D3D12Backend::EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c) {
+     if (count <= kQuadVertices) CaptureInputs(s, a, c);
++    // the first big draw of each vertex shader: its transform rows at full precision
++    else if (cap_sh_.insert((1ull << 40) | s.vs_handle).second) {
++        fprintf(cap_, "\n     transform");
++        for (int r : {0, 1, 2, 3, 96, 97, 98, 99, 100}) {
++            const auto& v = s.vsc[size_t(r)];
++            fprintf(cap_, "\n     hw%d %.9g %.9g %.9g %.9g", r, v[0], v[1], v[2], v[3]);
++        }
++    }
+     fputc('\n', cap_);
+ }
+ 
+@@ -3223,7 +3323,7 @@ void D3D12Backend::UploadGammaRamp() {
+     cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+ }
+ 
+-void D3D12Backend::BlitFrame(Target& t) {
++void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* shown, DXGI_FORMAT shown_fmt) {
+     // 16:9 when the console reports a widescreen display, else 4:3
+     bool wide = app::Widescreen();
+     float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+@@ -3237,6 +3337,10 @@ void D3D12Backend::BlitFrame(Target& t) {
+     cl_->RSSetViewports(1, &vp);
+     cl_->RSSetScissorRects(1, &scissor);
+     binds_ = {};
++    if (shown) {
++        Blit(shown, shown_fmt, uv, {.gamma = gamma_});
++        return;
++    }
+     Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+     Blit(t.res.Get(), t.fmt, uv, {.gamma = gamma_});
+ }
+@@ -3254,6 +3358,13 @@ void D3D12Backend::RenderUi() {
+ }
+ 
+ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
++    // the extension's passes run before the back buffer is bound
++    ID3D12Resource* shown = nullptr;
++    DXGI_FORMAT shown_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
++    if (t && ext_) {
++        shown_fmt = t->fmt;
++        shown = ext_->Present(*this, *t, shown_fmt);
++    }
+     D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
+     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
+     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
+@@ -3261,7 +3372,7 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
+     cl_->ClearRenderTargetView(rh, black, 0, nullptr);
+     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+     bound_rt_ = bound_ds_ = nullptr;
+-    if (t) BlitFrame(*t);
++    if (t) BlitFrame(*t, shown, shown_fmt);
+     RenderUi();
+     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
+ }
+diff --git a/runtime/gpu/ext.h b/runtime/gpu/ext.h
+index ce6acda..224f524 100644
+--- a/runtime/gpu/ext.h
++++ b/runtime/gpu/ext.h
+@@ -87,6 +87,8 @@ public:
+     virtual void Constants(float (*/*vsc*/)[4], float* /*ext*/, const Target* /*rt*/, uint32_t /*src_blend*/) {}
+     // a target with range other than 1 is read, copied or presented
+     virtual void Resolve(Context&, Target&) {}
++    // the frame about to be shown: a texture (in a pixel shader resource state, format fmt) to show instead, or null
++    virtual ID3D12Resource* Present(Context&, Target&, DXGI_FORMAT& /*fmt*/) { return nullptr; }
+ };
+ 
+ inline std::unique_ptr<Extension> g_extension;
+diff --git a/runtime/gpu/render_thread.cpp b/runtime/gpu/render_thread.cpp
+index 85adbb4..6025709 100644
+--- a/runtime/gpu/render_thread.cpp
++++ b/runtime/gpu/render_thread.cpp
+@@ -222,9 +222,20 @@ public:
+         Cmd c{Op::GetReport};
+         c.a = report;
+         cur_->cmds.push_back(c);
++        reports_unflushed_ = true;
+     }
+ 
+-    uint32_t Fence() override { return uint32_t(cur_->id); }
++    // A title that polls a visibility test (D3D_SetFence in its loop) while it waits for a report would wait for
++    // the Present that delivers it, which only the same thread issues: the batch goes out and the GPU runs it now.
++    uint32_t Fence() override {
++        uint32_t id = uint32_t(cur_->id);
++        if (reports_unflushed_) {
++            reports_unflushed_ = false;
++            cur_->cmds.push_back(Cmd{Op::Flush});
++            Submit();
++        }
++        return id;
++    }
+     bool FencePending(uint32_t fence) override { return fence > done_.load(); }
+     void WaitFence(uint32_t fence) override { Wait(fence, WaitFor::Fence, "fence"); }
+     bool Busy(uint32_t resource) override {
+@@ -494,6 +505,7 @@ private:
+     std::unordered_set<uint32_t> written_;  // surfaces drawn since their last read-back, by data address
+     std::unordered_set<uint64_t> logged_;   // perf diagnostic: read-backs named once, by address and kind
+     uint64_t next_id_ = 0, last_present_ = 0;
++    bool reports_unflushed_ = false;  // a GetReport that no Flush has followed
+     uint64_t presents_ = 0;
+ 
+     // the render thread
+diff --git a/runtime/gpu/shaders.cpp b/runtime/gpu/shaders.cpp
+index 6d263d6..6bedd57 100644
+--- a/runtime/gpu/shaders.cpp
++++ b/runtime/gpu/shaders.cpp
+@@ -32,6 +32,7 @@ struct VOut {
+     float4 tc2 : TEXCOORD2;
+     float4 tc3 : TEXCOORD3;
+     float fogamt : TEXCOORD4;
++    float psize : TEXCOORD6;
+ };
+ cbuffer VC : register(b0) { float4 c[192]; };
+ cbuffer DC : register(b1) {
+@@ -54,6 +55,7 @@ const char* kCommonTail = R"(    float4 spread[4];
+     float4 amb;
+     float4 lt[56];
+     float4 rtshift;
++    float4 ptsz;
+     float4 zparams;
+ };
+ )";
+@@ -242,6 +244,7 @@ const char* kVsEpilogue = R"(
+     o.tc2 = oT2;
+     o.tc3 = oT3;
+     o.fogamt = fogfactor(oFog.x);
++    o.psize = oPts.x;
+     return o;
+ }
+ )";
+@@ -251,7 +254,7 @@ const char* kVsPrologue = R"(
+     // precise: EQUAL depth passes need bit exact positions
+     precise float4 R0 = 0, R1 = 0, R2 = 0, R3 = 0, R4 = 0, R5 = 0, R6 = 0, R7 = 0, R8 = 0, R9 = 0, R10 = 0, R11 = 0;
+     precise float4 oPos = 0;
+-    float4 oD0 = float4(0, 0, 0, 1), oD1 = 0, oB0 = float4(0, 0, 0, 1), oB1 = 0, oFog = 0, oPts = 1;
++    float4 oD0 = float4(0, 0, 0, 1), oD1 = 0, oB0 = float4(0, 0, 0, 1), oB1 = 0, oFog = 0, oPts = ptsz.y;
+     float4 oT0 = float4(0, 0, 0, 1), oT1 = float4(0, 0, 0, 1), oT2 = float4(0, 0, 0, 1), oT3 = float4(0, 0, 0, 1);
+ )";
+ 
+@@ -857,6 +860,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
+     o.tc2 = oT2;
+     o.tc3 = oT3;
+     o.fogamt = fogfactor(abs(cp.z));
++    o.psize = ptsz.y;
+     return o;
+ }
+ )";
+@@ -995,18 +999,26 @@ std::string ReversedDepthHlsl(std::string s) {
+     return s;
+ }
+ 
+-// a point covers its console pixel, several host pixels on an upscaled target: drawn as a quad of that size
++// a point covers its console pixels (its size, one by default), several host pixels on an upscaled target: drawn as a
++// quad of that size, with sprite texture coordinates when D3DRS_POINTSPRITEENABLE is set
+ std::string PointHlsl() {
+     return Common() + R"(
+ [maxvertexcount(4)]
+ void main(point VOut v[1], inout TriangleStream<VOut> strip) {
+-    float2 half_pixel = v[0].pos.w / surf.xy;  // in clip units, the target spans 2 across surf.xy pixels
++    float size = v[0].psize;
++    if (ptsz.w > 0) size = clamp(size, ptsz.z, ptsz.w);
++    size = max(size, 1);
++    float2 half_pixel = size * v[0].pos.w / surf.xy;  // in clip units, the target spans 2 across surf.xy pixels
+     // a target is read half a host pixel back (surf.w host pixels per console pixel): left and top reach that far
+-    float2 back = (0.5 - 1e-3) * 2 * half_pixel / surf.w;
++    float2 back = (0.5 - 1e-3) * 2 * (v[0].pos.w / surf.xy) / surf.w;
+     for (int i = 0; i < 4; i++) {
+         VOut o = v[0];
+         o.pos.x += (i & 1) ? half_pixel.x : -half_pixel.x - back.x;
+         o.pos.y += (i & 2) ? -half_pixel.y : half_pixel.y + back.y;
++        if (ptsz.x != 0) {
++            float4 uv = float4(i & 1, (i >> 1) & 1, 0, 1);
++            o.tc0 = o.tc1 = o.tc2 = o.tc3 = uv;
++        }
+         strip.Append(o);
+     }
+ }
+diff --git a/runtime/gpu/shaders.h b/runtime/gpu/shaders.h
+index 08d9bff..1774a2e 100644
+--- a/runtime/gpu/shaders.h
++++ b/runtime/gpu/shaders.h
+@@ -104,6 +104,7 @@ struct DrawConstants {
+     float amb[4];        // D3DRS_AMBIENT
+     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
+     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
++    float ptsz[4];       // points: sprite enable, size, min, max
+     float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
+ };
+ 
+diff --git a/runtime/kernel/files.cpp b/runtime/kernel/files.cpp
+index 5644ea7..bbea8c3 100644
+--- a/runtime/kernel/files.cpp
++++ b/runtime/kernel/files.cpp
+@@ -21,6 +21,32 @@ std::map<std::string, std::string> g_links;    // upper case "\??\D:" -> "\Devic
+ std::map<std::string, fs::path> g_devices;     // upper case device -> host directory
+ constexpr char kCdRom[] = "\\DEVICE\\CDROM0";
+ 
++// The last file calls (O open, M missing or refused, I transfer, X bad handle), for F3 to place a stall.
++struct IoEvent {
++    int64_t ms;
++    uint32_t a, b;
++    char kind;
++    char text[40];
++};
++constexpr uint32_t kIoEvents = 256;
++IoEvent g_io_events[kIoEvents];
++uint32_t g_io_count = 0;
++std::mutex g_io_lock;
++int64_t IoNowMs() {
++    using namespace std::chrono;
++    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
++}
++void IoTrace(char kind, const std::string& name, uint32_t a, uint32_t b) {
++    std::lock_guard<std::mutex> lock(g_io_lock);
++    IoEvent& e = g_io_events[g_io_count++ % kIoEvents];
++    e.ms = IoNowMs();
++    e.a = a;
++    e.b = b;
++    e.kind = kind;
++    size_t from = name.size() > sizeof(e.text) - 1 ? name.size() - (sizeof(e.text) - 1) : 0;
++    std::snprintf(e.text, sizeof(e.text), "%s", name.c_str() + from);
++}
++
+ std::string Upper(std::string s) {
+     for (char& c : s) c = char(std::toupper(uint8_t(c)));
+     return s;
+@@ -78,6 +104,7 @@ struct File : Object {
+     size_t next = 0;
+     bool listed = false;
+     bool delete_on_close = false;
++    bool async = false;  // opened without FILE_SYNCHRONOUS_IO_*: the console returns STATUS_PENDING for transfers
+     std::mutex io;  // threads sharing a handle: seek and transfer stay together
+     File() : Object(ObjType::File) {}
+     ~File() override {
+@@ -277,8 +304,8 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
+ }
+ 
+ // the disc image is read only: nothing on it is created, replaced or written
+-uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t handle_out, uint32_t iosb, uint32_t disposition,
+-                    uint32_t options) {
++uint32_t OpenOnDiscImpl(const Disc::Entry* e, const std::string& name, uint32_t handle_out, uint32_t iosb, uint32_t disposition,
++                        uint32_t options) {
+     if (!e && (disposition == 1 || disposition == 4)) {  // FILE_OPEN or FILE_OVERWRITE need an existing file
+         LOG_FIRST(200, "missing %s", name.c_str());
+         IoStatus(iosb, kObjectNameNotFound, 5);
+@@ -296,14 +323,34 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
+     f->xbox = Normalize(name);
+     f->entry = e;
+     f->dir = e->dir;
++    f->async = !(options & 0x30);
+     W32(handle_out, NewHandle(f));
+     IoStatus(iosb, kSuccess, 1);
+     LOG_FIRST(400, "open %s", name.c_str());
+     return kSuccess;
+ }
+ 
++uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t handle_out, uint32_t iosb, uint32_t disposition,
++                    uint32_t options) {
++    uint32_t r = OpenOnDiscImpl(e, name, handle_out, iosb, disposition, options);
++    IoTrace(r == kSuccess ? 'O' : 'M', name, r, r == kSuccess ? R32(handle_out) : 0);
++    return r;
++}
++
+ }  // namespace
+ 
++void DumpFiles() {
++    std::lock_guard<std::mutex> lock(g_io_lock);
++    int64_t now = IoNowMs();
++    LOGR("files: last calls, newest last (ms ago, O open/M refused with status and handle, I transfer with bytes and "
++         "status, X bad handle)");
++    uint32_t n = std::min(g_io_count, 64u);
++    for (uint32_t i = g_io_count - n; i < g_io_count; i++) {
++        const IoEvent& e = g_io_events[i % kIoEvents];
++        LOGR("  -%lld %c %X %X %s", (long long)(now - e.ms), e.kind, e.a, e.b, e.text);
++    }
++}
++
+ std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle) { return Resolve(xbox_path, root_handle).host; }
+ 
+ bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
+@@ -418,6 +465,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
+     f->xbox = Normalize(name);
+     f->fp = fp;
+     f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
++    f->async = !(options & 0x30);
+     W32(handle_out, NewHandle(f));
+     IoStatus(iosb, kSuccess, info);
+     LOG_FIRST(400, "open %s", name.c_str());
+@@ -447,7 +495,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
+         if (!f->fp) f->fp = std::fopen(host.c_str(), "rb");
+         if (!f->fp) return kAccessDenied;
+     }
+-    (void)options;
++    f->async = !(options & 0x30);
+     W32(handle_out, NewHandle(f));
+     IoStatus(iosb, kSuccess, 1);
+     return kSuccess;
+@@ -456,6 +504,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
+ // I/O completes before the call returns: the status block is written, then the file object, the event and the
+ // APC are signalled (GetOverlappedResult without an event waits on the file handle)
+ static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
++    IoTrace('I', f.xbox, n, status);
+     IoStatus(iosb, status, n);
+     SetEvent(f);
+     Complete(event, apc, apc_ctx, iosb);
+@@ -471,7 +520,10 @@ static uint64_t Offset(File& f, uint32_t off) {
+ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
+     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], buf = a[5], len = a[6], off = a[7];
+     auto f = FileFromHandle(h);
+-    if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
++    if (!f || (!f->fp && !f->entry)) {
++        IoTrace('X', "", h, 0);
++        return kInvalidHandle;
++    }
+     if (write && f->entry) return kAccessDenied;
+     ResetEvent(*f);
+     std::lock_guard<std::mutex> lock(f->io);
+@@ -490,7 +542,9 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
+     f->pos = pos + n;
+     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
+     if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
+-    return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
++    // the transfer is already done, the status block and event are set; only the return value reports it as queued
++    uint32_t r = Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
++    return f->async ? uint32_t(kPending) : r;
+ }
+ 
+ KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, 0); }
+@@ -571,10 +625,23 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
+             std::string target = ReadAnsiString(in + 8);
+             std::string host = ResolvePath(target, root);
+             if (host.empty()) return kObjectPathNotFound;
+-            if (f->fp) std::fflush(f->fp);
++            // Windows will not rename a file this process holds open
++            bool reopen = f->fp != nullptr;
++            if (f->fp) {
++                std::lock_guard<std::mutex> lock(f->io);
++                std::fclose(f->fp);
++                f->fp = nullptr;
++            }
+             fs::rename(f->host, host, ec);
+-            if (ec) return kAccessDenied;
+-            f->host = host;
++            if (!ec) f->host = host;
++            if (reopen) {
++                f->fp = std::fopen(f->host.string().c_str(), "r+b");
++                if (!f->fp) f->fp = std::fopen(f->host.string().c_str(), "rb");
++            }
++            if (ec) {
++                LOG_FIRST(8, "rename failed: %s", ec.message().c_str());
++                return kAccessDenied;
++            }
+             break;
+         }
+         case 4:  // basic, times and attributes are not kept
+@@ -632,7 +699,8 @@ KERNEL_EXPORT(207, NtQueryDirectoryFile, 10) {
+         LOG_FIRST(8, "NtQueryDirectoryFile: class %u", cls);
+         return kInvalidParameter;
+     }
+-    std::string pat = mask ? ReadAnsiString(mask) : "*";
++    std::string pat = mask ? ReadAnsiString(mask) : "";
++    if (pat.empty()) pat = "*";  // a null or empty FileName lists everything
+     if (!f->listed || (restart & 0xFF)) {
+         f->entries.clear();
+         f->disc_entries.clear();
+diff --git a/runtime/kernel/kernel.h b/runtime/kernel/kernel.h
+index 163ea09..a69bc4c 100644
+--- a/runtime/kernel/kernel.h
++++ b/runtime/kernel/kernel.h
+@@ -169,6 +169,7 @@ void StartHostThread(const char* name, std::function<void(X86Context&)> fn);
+ void RunDpcs(X86Context& ctx);
+ void InitKernelData();
+ void LogGuestStack(X86Context& ctx, int words);
++void DumpFiles();  // F3: the last file calls
+ X86Context& CurrentContext();
+ ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,
+                        uint32_t start_context, bool suspended);
+diff --git a/runtime/kernel/objects.cpp b/runtime/kernel/objects.cpp
+index 4974985..22860a7 100644
+--- a/runtime/kernel/objects.cpp
++++ b/runtime/kernel/objects.cpp
+@@ -59,7 +59,9 @@ struct Queued {
+     void Remove() {
+         if (!on) return;
+         for (auto& o : objs) {
+-            if (o) std::erase(o->waiters, &w);
++            if (!o) continue;
++            std::erase(o->waiters, &w);
++            if (o->type == ObjType::Mutant) Wake(*o);  // the next in line may be the one to take it
+         }
+         std::erase(g_waiters, &w);
+         on = false;
+@@ -178,8 +180,10 @@ static uint32_t Me() {
+     return t ? t->ethread : 1;
+ }
+ 
+-static bool Satisfied(Object& o, uint32_t me) {
+-    if (o.type == ObjType::Mutant) return o.signal > 0 || o.owner == me;
++// A mutant going free is handed to the longest blocked wait, as the console's dispatcher does; without that, a thread that
++// releases and re-takes it in a loop starves the others.
++static bool Satisfied(Object& o, uint32_t me, const Waiter* w) {
++    if (o.type == ObjType::Mutant) return o.owner == me || (o.signal > 0 && (o.waiters.empty() || o.waiters.front() == w));
+     return o.signal > 0;
+ }
+ 
+@@ -231,14 +235,14 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
+     Queued queued{objs};
+     for (;;) {
+         if (wait_all) {
+-            bool all = std::all_of(objs.begin(), objs.end(), [&](const ObjectRef& o) { return o && Satisfied(*o, me); });
++            bool all = std::all_of(objs.begin(), objs.end(), [&](const ObjectRef& o) { return o && Satisfied(*o, me, &queued.w); });
+             if (all) {
+                 for (auto& o : objs) Consume(*o, me);
+                 return kWait0;
+             }
+         } else {
+             for (size_t i = 0; i < objs.size(); i++)
+-                if (objs[i] && Satisfied(*objs[i], me)) {
++                if (objs[i] && Satisfied(*objs[i], me, &queued.w)) {
+                     Consume(*objs[i], me);
+                     return kWait0 + uint32_t(i);
+                 }
+diff --git a/runtime/kernel/xboxkrnl.cpp b/runtime/kernel/xboxkrnl.cpp
+index bec6e36..833a0ca 100644
+--- a/runtime/kernel/xboxkrnl.cpp
++++ b/runtime/kernel/xboxkrnl.cpp
+@@ -986,8 +986,8 @@ KERNEL_EXPORT(269, RtlCompareMemoryUlong, 3) {
+     return n;
+ }
+ 
+-KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
+-    switch (a[0]) {
++static uint32_t DosError(uint32_t status) {
++    switch (status) {
+         case kSuccess: return 0;
+         case kPending: return 997;
+         case kTimeout: return 1460;
+@@ -1010,10 +1010,19 @@ KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) {
+         case kNotADirectory: return 267;
+         case 0xC000007F: return 112;  // disk full
+         case kDeviceNotConnected: return 1167;
+-        default: return (a[0] & 0xC0000000) ? 317 : 0;
++        default: return (status & 0xC0000000) ? 317 : 0;
+     }
+ }
+ 
++KERNEL_EXPORT(301, RtlNtStatusToDosError, 1) { return DosError(a[0]); }
++
++// ReadFileEx and WriteFileEx pass this as the APC routine and the caller's completion routine as the context; the status
++// block is the OVERLAPPED
++KERNEL_EXPORT(232, NtUserIoApcDispatcher, 3) {
++    uint32_t iosb = a[1];
++    return CallGuest(ctx, a[0], {DosError(R32(iosb)), R32(iosb + 4), iosb});
++}
++
+ // exceptions, debug, shutdown
+ 
+ // Exceptions dispatch like NT on x86: each handler of the fs:[0] chain is called (record, frame, context,
+diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
+index 975e977..bb43f23 100644
+--- a/runtime/xdk/d3d8.cpp
++++ b/runtime/xdk/d3d8.cpp
+@@ -81,6 +81,10 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
+ #define SYM_D3D_BlockOnNonSurfaceResource FFFFFE0A
+ #define HAS_D3D_BlockOnNonSurfaceResource 0
+ #endif
++#ifndef SYM_D3DDevice_DrawIndexedVerticesUP
++#define SYM_D3DDevice_DrawIndexedVerticesUP FFFFFE0B
++#define HAS_D3DDevice_DrawIndexedVerticesUP 0
++#endif
+ 
+ namespace d3d {
+ 
+@@ -414,9 +418,9 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
+                 LOGI("d3d: BlockOnResource on surface %08X, stack %08X %08X %08X %08X", data, code[0], code[1], code[2], code[3]);
+             }
+             g_backend->Sync(data, 0);
+-        } else {
+-            g_backend->WaitResource(res);
+         }
++        // the GPU may still be reading it too: draws recorded with this resource must finish before the title writes it
++        g_backend->WaitResource(res);
+     }
+     gpu::MarkDirty(res);
+     return 0;
+@@ -425,6 +429,11 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
+ // title may read what the GPU drew
+ HLE_WRAP(Lock2DSurface, 6) {
+     uint32_t res = a[0];
++    if (!(a[5] & 0x20) && res && g_backend) {  // a CPU write must wait for draws still sampling the texture
++        std::lock_guard<std::recursive_mutex> lock(g_lock);
++        g_backend->WaitResource(res);
++        gpu::MarkDirty(res);
++    }
+     if ((a[5] & 0x20) && res && g_backend) {  // D3DLOCK_NOOVERWRITE
+         std::lock_guard<std::recursive_mutex> lock(g_lock);
+         g_backend->SyncLate(mem::VirtualFromPhysical(R32(res + 4)));
+@@ -898,6 +907,8 @@ HLE_STDCALL(D3DDevice_CreateVertexShader, 4) {
+     uint32_t rec = mem::AllocSystem(16, 16);
+     vs->handle = rec | 1;
+     g_vs[vs->handle] = vs;
++    // the inlined GetVertexShaderSize reads the instruction count here, games chain load slots with it
++    W32(rec + 8, uint32_t(vs->program.size() / 4));
+     W32(out, vs->handle);
+     LOG_FIRST(64, "d3d: vertex shader %08X, %zu decl tokens, %zu instructions, type %X", vs->handle, vs->decl.size(),
+               vs->program.size() / 4, vs->program_type);
+@@ -1398,6 +1409,24 @@ HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
+     return 0;
+ }
+ 
++// DrawIndexedVerticesUP(prim, index count, 16 bit indices, vertices, stride): the vertices up to the highest index go to
++// the ring as DrawVerticesUP's do, the backend copies the indices
++HLE_STDCALL(D3DDevice_DrawIndexedVerticesUP, 5) {
++    std::lock_guard<std::recursive_mutex> lock(g_lock);
++    Walk(Dev(kDevPush));
++    uint32_t count = a[1], stride = a[4];
++    if (!g_backend || !count || !stride || !a[2] || !a[3]) return 0;
++    const uint16_t* indices = static_cast<const uint16_t*>(HostPtr(a[2]));
++    uint32_t top = 0;
++    for (uint32_t i = 0; i < count; i++) top = std::max<uint32_t>(top, indices[i]);
++    SyncDeferred();
++    auto stream = g_state.streams[0];
++    g_state.streams[0] = {UpVertices(HostPtr(a[3]), (top + 1) * stride), stride};
++    g_backend->Draw(g_state, a[0], 0, count, reinterpret_cast<const uint8_t*>(indices));
++    g_state.streams[0] = stream;
++    return 0;
++}
++
+ // BeginPush(dwords) hands out room for raw hardware commands, EndPush(end) runs what the title wrote there:
+ // a primitive between two begin/end writes with its vertices inline or as vertex data, other methods as simple states.
+ HLE_STDCALL(D3DDevice_BeginPush, 1) {
+diff --git a/runtime/xdk/dsound.cpp b/runtime/xdk/dsound.cpp
+index b322778..a723ee7 100644
+--- a/runtime/xdk/dsound.cpp
++++ b/runtime/xdk/dsound.cpp
+@@ -85,6 +85,30 @@ X86Func* Find(uint32_t guest);
+ #define SYM_IDirectSoundBuffer_SetEG FFFFFF0E
+ #define HAS_IDirectSoundBuffer_SetEG 0
+ #endif
++#ifndef SYM_IDirectSoundBuffer_SetRolloffFactor
++#define SYM_IDirectSoundBuffer_SetRolloffFactor FFFFFF12
++#define HAS_IDirectSoundBuffer_SetRolloffFactor 0
++#endif
++#ifndef SYM_IDirectSoundBuffer_SetMode
++#define SYM_IDirectSoundBuffer_SetMode FFFFFF11
++#define HAS_IDirectSoundBuffer_SetMode 0
++#endif
++#ifndef SYM_IDirectSoundBuffer_SetPitch
++#define SYM_IDirectSoundBuffer_SetPitch FFFFFF10
++#define HAS_IDirectSoundBuffer_SetPitch 0
++#endif
++#ifndef SYM_IDirectSoundBuffer_SetNotificationPositions
++#define SYM_IDirectSoundBuffer_SetNotificationPositions FFFFFF0F
++#define HAS_IDirectSoundBuffer_SetNotificationPositions 0
++#endif
++#ifndef SYM_IDirectSound_CreateSoundStream
++#define SYM_IDirectSound_CreateSoundStream FFFFFF13
++#define HAS_IDirectSound_CreateSoundStream 0
++#endif
++#ifndef SYM_CDirectSoundStream_SetPitch
++#define SYM_CDirectSoundStream_SetPitch FFFFFF14
++#define HAS_CDirectSoundStream_SetPitch 0
++#endif
+ 
+ namespace {
+ 
+@@ -125,8 +149,16 @@ struct Gains {
+     float bin[kRows][kBins];
+ };
+ 
++// DSBPOSITIONNOTIFY: the event is set when the play cursor passes the byte offset
++struct Note {
++    uint32_t offset, event;
++};
++constexpr uint32_t kOffsetStop = 0xFFFFFFFF;  // DSBPN_OFFSETSTOP: set when the buffer stops
++constexpr uint32_t kMaxNotes = 64;
++
+ struct Voice {
+     uint32_t obj = 0;
++    std::vector<Note> notes;
+     bool stream = false;
+     int refs = 1;
+     // format
+@@ -151,7 +183,7 @@ struct Voice {
+     std::vector<float> curve;  // rolloff
+     bool is3d = false;
+     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
+-    float p[3] = {}, min_dist = 1, max_dist = 1e9f;
++    float p[3] = {}, min_dist = 1, max_dist = 1e9f, rolloff = 1;
+     Gains gain = {};  // the last block's gains, the next block ramps from them
+     bool has_gain = false;
+     // a mono 3D voice's interaural delay in samples and its recent samples
+@@ -179,6 +211,22 @@ thread_local std::vector<Done> t_flushed;  // run by the STREAM call that flushe
+ std::atomic<int64_t> g_pumped{0};          // the last DirectSoundDoWork, steady ms
+ bool g_started = false;
+ uint32_t g_ds = 0;
++
++// The last stream events (P process, C complete, F flush, D discontinuity, Z pause), for F3 to place a silent voice.
++struct Event {
++    int64_t ms;
++    uint32_t obj, a, b, ret;
++    char kind;
++};
++constexpr uint32_t kEvents = 512;
++Event g_events[kEvents];
++uint32_t g_event_count = 0;
++thread_local uint32_t t_ret = 0;  // the guest caller of the stream call in progress
++void Trace(char kind, const Voice& v, uint32_t a, uint32_t b) {
++    using namespace std::chrono;
++    int64_t ms = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
++    g_events[g_event_count++ % kEvents] = {ms, v.obj, a, b, t_ret, kind};
++}
+ // IDirectSound_SetMixBinHeadroom: the voice processor halves a bin per step, 1 for every bin but the last by default
+ uint8_t g_bin_headroom[kBins] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                                  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0};
+@@ -261,7 +309,8 @@ float Sample(Voice& v, uint32_t data, uint32_t f, int c) {
+ }
+ 
+ void Complete(Voice& v, Packet& pk, uint32_t status) {
+-    if (pk.completed_ptr) W32(pk.completed_ptr, status == 0 ? pk.size : pk.used);
++    Trace('C', v, status, pk.context);
++    if (pk.completed_ptr) W32(pk.completed_ptr, pk.size);
+     if (pk.status_ptr) W32(pk.status_ptr, status);
+     if (v.callback) {
+         g_done.push_back({v.obj, v.callback, v.context, pk.context, status});
+@@ -393,7 +442,7 @@ void ShareCentre(Place& at) {
+ // distance attenuation, 1.0 inside the min distance: min / distance, or the voice's rolloff curve
+ float Attenuation(const Voice& v, float dist) {
+     if (dist <= v.min_dist) return 1;
+-    if (v.curve.empty()) return v.min_dist / std::min(dist, v.max_dist);
++    if (v.curve.empty()) return v.min_dist / (v.min_dist + v.rolloff * (std::min(dist, v.max_dist) - v.min_dist));
+     if (v.max_dist <= v.min_dist) return 1;
+     // points spread evenly from min to max distance, 1.0 at min
+     float at = (std::min(dist, v.max_dist) - v.min_dist) / (v.max_dist - v.min_dist) * v.curve.size();
+@@ -607,13 +656,36 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
+     v.itd = itd;
+ }
+ 
++void Signal(uint32_t handle) {
++    if (ObjectRef e = FromHandle(handle)) SetEvent(*e);
++}
++
++// sets the events of the notifications the cursor passed while the block played from `before`
++void Notify(Voice& v, double before, bool was_playing) {
++    bool stopped = was_playing && !v.playing;
++    double base = FramesOf(v, v.play_start);
++    double from = base + before, to = base + (stopped ? double(FramesOf(v, v.play_len)) : v.pos);
++    bool wrapped = !stopped && to < from;
++    for (const Note& n : v.notes) {
++        if (n.offset == kOffsetStop) {
++            if (stopped) Signal(n.event);
++            continue;
++        }
++        double f = FramesOf(v, n.offset);
++        if (wrapped ? (f > from || f <= to) : (f > from && f <= to)) Signal(n.event);
++    }
++}
++
+ void Render(float* out, uint32_t frames) {
+     static std::vector<float> bins;  // the output thread alone renders
+     bins.assign(size_t(frames) * kBins, 0.0f);
+     std::lock_guard<std::recursive_mutex> lock(g_lock);
+     for (auto& [obj, v] : g_voices) {
+         if (v.paused || v.sync || (!v.stream && !v.playing)) continue;
++        double before = v.pos;
++        bool was_playing = v.playing;
+         MixVoice(v, bins.data(), frames);
++        if (!v.stream && !v.notes.empty()) Notify(v, before, was_playing);
+     }
+     if (dsp::Loaded()) dsp::Run(bins.data(), frames);
+     for (uint32_t i = 0; i < frames; i++) {
+@@ -725,6 +797,30 @@ float F32(uint32_t v) {
+ 
+ }  // namespace
+ 
++// F3: what the mixer holds, to place a silent voice
++void DumpAudio() {
++    std::lock_guard<std::recursive_mutex> lock(g_lock);
++    LOGR("dsound: %zu voices, %zu callbacks waiting, last DoWork %lld ms ago", g_voices.size(), g_done.size(),
++         (long long)(NowMs() - g_pumped));
++    for (auto& [obj, v] : g_voices) {
++        float peak = 0;
++        for (auto& row : v.gain.bin)
++            for (float g : row) peak = std::max(peak, std::fabs(g));
++        LOGR("  %08X %s tag %X ch %u %uHz %s%s%s%s packets %zu/%u vol %.2f peak gain %.3f bins %u 3d %d mode %u pos %.0f",
++             obj, v.stream ? "stream" : "buffer", v.tag, v.channels, v.freq ? v.freq : v.rate,
++             v.playing ? "playing " : "", v.paused ? "PAUSED " : "", v.sync ? "SYNC " : "", v.active ? "active " : "",
++             v.packets.size(), v.max_packets, v.volume, peak, v.nbins, v.is3d, v.mode, v.pos);
++    }
++    int64_t now = NowMs();
++    LOGR("dsound: last stream events, newest last (ms ago, voice, P process size/context, C complete status/context, "
++         "F flush packets/active, D discontinuity packets/active, Z pause arg)");
++    uint32_t n = std::min(g_event_count, 96u);
++    for (uint32_t i = g_event_count - n; i < g_event_count; i++) {
++        const Event& e = g_events[i % kEvents];
++        LOGR("  -%lld %08X %c %X %X from %X", (long long)(now - e.ms), e.obj, e.kind, e.a, e.b, e.ret);
++    }
++}
++
+ // device
+ 
+ // DSOUND objects are the host's; .XTLID names linked exports that would still run console code on them
+@@ -743,12 +839,13 @@ static void AuditExports() {
+         SYM(XAudioDownloadEffectsImage), SYM(DirectSoundCreateBuffer), SYM(IDirectSound_CreateSoundBuffer),
+         SYM(IDirectSoundBuffer_Release), SYM(IDirectSoundBuffer_Unlock), SYM(IDirectSoundBuffer_SetBufferData),
+         SYM(IDirectSoundBuffer_Play), SYM(IDirectSoundBuffer_Stop), SYM(IDirectSoundBuffer_SetLoopRegion),
++        SYM(IDirectSoundBuffer_SetNotificationPositions), SYM(IDirectSoundBuffer_SetPitch), SYM(IDirectSoundBuffer_SetMode), SYM(IDirectSoundBuffer_SetRolloffFactor),
+         SYM(IDirectSoundBuffer_GetStatus), SYM(IDirectSoundBuffer_GetCurrentPosition), SYM(IDirectSoundBuffer_SetCurrentPosition),
+         SYM(IDirectSoundBuffer_Lock), SYM(IDirectSoundBuffer_SetVolume), SYM(IDirectSoundBuffer_SetFrequency),
+         SYM(IDirectSoundBuffer_SetFilter), SYM(IDirectSoundBuffer_SetHeadroom), SYM(IDirectSoundBuffer_SetMixBinVolumes),
+         SYM(IDirectSoundBuffer_SetMixBins), SYM(IDirectSoundBuffer_SetMaxDistance), SYM(IDirectSoundBuffer_SetMinDistance),
+         SYM(IDirectSoundBuffer_SetPosition), SYM(IDirectSoundBuffer_SetVelocity), SYM(IDirectSoundBuffer_SetI3DL2Source),
+-        SYM(DirectSoundCreateStream), SYM(CDirectSoundStream_AddRef), SYM(CDirectSoundStream_SetFormat),
++        SYM(DirectSoundCreateStream), SYM(IDirectSound_CreateSoundStream), SYM(CDirectSoundStream_SetPitch), SYM(CDirectSoundStream_AddRef), SYM(CDirectSoundStream_SetFormat),
+         SYM(CDirectSoundStream_Release), SYM(CDirectSoundStream_GetInfo), SYM(CDirectSoundStream_GetStatus),
+         SYM(CDirectSoundStream_Process), SYM(CDirectSoundStream_Discontinuity), SYM(CDirectSoundStream_Flush),
+         SYM(CDirectSoundStream_FlushEx), SYM(CDirectSoundStream_Pause), SYM(CDirectSoundStream_SetVolume),
+@@ -978,7 +1075,17 @@ BUFFER(Play, 4) {
+     return 0;
+ }
+ BUFFER(Stop, 1) {
++    bool was_playing = v.playing;
+     v.playing = false;
++    if (was_playing)
++        for (const Note& n : v.notes)
++            if (n.offset == kOffsetStop) Signal(n.event);
++    return 0;
++}
++// (this, count, DSBPOSITIONNOTIFY array): replaces the notifications, none clears them
++BUFFER(SetNotificationPositions, 3) {
++    v.notes.clear();
++    for (uint32_t i = 0; a[2] && i < std::min(a[1], kMaxNotes); i++) v.notes.push_back({R32(a[2] + i * 8), R32(a[2] + i * 8 + 4)});
+     return 0;
+ }
+ // (this, time low, time high, flags): stops now, the release envelope is not reproduced
+@@ -1044,6 +1151,20 @@ BUFFER(SetFrequency, 2) {
+     v.freq = a[1];
+     return 0;
+ }
++BUFFER(SetPitch, 2) {
++    // 1/4096 octave steps relative to the 48 kHz mixer rate
++    v.freq = uint32_t(audio::kRate * std::exp2(double(int32_t(a[1])) / 4096.0));
++    return 0;
++}
++BUFFER(SetMode, 3) {
++    v.mode = a[1];
++    return 0;
++}
++// (this, factor, apply)
++BUFFER(SetRolloffFactor, 3) {
++    v.rolloff = F32(a[1]);
++    return 0;
++}
+ BUFFER(SetFilter, 2) { return 0; }
+ BUFFER(SetHeadroom, 2) {
+     v.headroom = Db(-int32_t(a[1]));
+@@ -1095,12 +1216,11 @@ BUFFER(SetFormat, 2) {
+ 
+ // streams, the object carries the XDK's own vtable
+ 
+-HLE_STDCALL(DirectSoundCreateStream, 2) {
++static uint32_t NewStream(uint32_t desc, uint32_t out) {
+     XDK_REQUIRE("dsound", XDK_KEY(CDirectSoundStream_Vtable), XDK_KEY(CDirectSoundStream_Vtable2),
+                 XDK_DATA(DSound_StreamVtable), XDK_DATA(DSound_StreamVtable2));
+     std::lock_guard<std::recursive_mutex> lock(g_lock);
+     Start();
+-    uint32_t desc = a[0];
+     uint32_t obj = mem::AllocSystem(0x80);
+     std::memset(HostPtr(obj), 0, 0x80);
+     W32(obj + XDK_CDirectSoundStream_Vtable, kStreamVtable);
+@@ -1116,9 +1236,12 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
+     SetBins(v, R32(desc + 20));
+     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
+     v.headroom = DefaultHeadroom(flags);
+-    W32(a[1], obj);
++    W32(out, obj);
+     return 0;
+ }
++HLE_STDCALL(DirectSoundCreateStream, 2) { return NewStream(a[0], a[1]); }
++// early XDKs create the stream through the device: (this, desc, out, outer)
++HLE_STDCALL(IDirectSound_CreateSoundStream, 4) { return NewStream(a[1], a[2]); }
+ 
+ #define STREAM(name, nargs)                                     \
+     static uint32_t str_##name(Voice& v, const Args& a);        \
+@@ -1127,6 +1250,7 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
+         std::vector<Done> flushed;                              \
+         {                                                       \
+             std::lock_guard<std::recursive_mutex> lock(g_lock); \
++            t_ret = R32(ctx.esp);                               \
+             Voice* v = Find(a[0]);                              \
+             r = v ? str_##name(*v, a) : 0x80004005u;            \
+             flushed.swap(t_flushed);                            \
+@@ -1138,6 +1262,7 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
+ 
+ // the stream's callbacks still queued and those of its flushed packets, in order, go to the calling thread
+ static void FlushStream(Voice& v) {
++    Trace('F', v, uint32_t(v.packets.size()), v.active);
+     for (auto& pk : v.packets) Complete(v, pk, kFlushed);
+     v.packets.clear();
+     v.pos = 0;
+@@ -1187,12 +1312,14 @@ STREAM(Process, 3) {
+     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
+     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
+     v.packets.push_back(pk);
+-    if (!v.active) v.has_gain = false;  // after going quiet a stream starts its levels fresh
++    Trace('P', v, pk.size, pk.context);
++    if (!v.active) v.has_gain = false;  // after going quiet a stream starts its levels fresh  // after going quiet a stream starts its levels fresh
+     v.active = true;
+     v.ending = false;
+     return 0;
+ }
+ STREAM(Discontinuity, 1) {
++    Trace('D', v, uint32_t(v.packets.size()), v.active);
+     if (!v.packets.empty()) v.ending = true;
+     else if (v.active) FlushStream(v);
+     return 0;
+@@ -1207,6 +1334,7 @@ STREAM(FlushEx, 4) {
+     return 0;
+ }
+ STREAM(Pause, 2) {
++    Trace('Z', v, a[1], 0);
+     v.paused = a[1] == 1;
+     v.sync = a[1] == 2;
+     return 0;
+@@ -1219,6 +1347,10 @@ STREAM(SetFrequency, 2) {
+     v.freq = a[1];
+     return 0;
+ }
++STREAM(SetPitch, 2) {
++    v.freq = uint32_t(audio::kRate * std::exp2(double(int32_t(a[1])) / 4096.0));
++    return 0;
++}
+ STREAM(SetFilter, 2) { return 0; }
+ // the library's own writes voice registers a host stream does not have; envelopes are not played
+ HLE_STDCALL(IDirectSoundStream_SetEG, 2) { return 0; }
+diff --git a/tools/recomp/analysis.cpp b/tools/recomp/analysis.cpp
+index 98682a5..c458ff9 100644
+--- a/tools/recomp/analysis.cpp
++++ b/tools/recomp/analysis.cpp
+@@ -541,6 +541,7 @@ void Analysis::Run() {
+         }
+     }
+     EhContinuations();
++    SetjmpContinuations();
+     // every direct call from decoded code names a function
+     for (bool changed = true; changed;) {
+         changed = false;
+@@ -631,6 +632,20 @@ void Analysis::EhContinuations() {
+     std::fprintf(stderr, "c++ eh: %zu catch blocks, %zu continuations\n", catches, continuations.size());
+ }
+ 
++// A call to a setjmp function returns a second time when longjmp jumps back to the instruction after the call.
++// That address is made a continuation, so the jump throws X86Resume and unwinds the host stack to the caller.
++void Analysis::SetjmpContinuations() {
++    if (cfg.setjmp.empty()) return;
++    std::vector<uint32_t> resumes;
++    for (auto& [va, insn] : insns_)
++        if (insn.flow == Flow::Call && cfg.setjmp.count(insn.target)) resumes.push_back(va + insn.len);
++    for (uint32_t c : resumes) {
++        MakeFunction(c);
++        if (functions.count(c)) continuations.insert(c);
++    }
++    std::fprintf(stderr, "setjmp: %zu resume points\n", resumes.size());
++}
++
+ std::vector<uint32_t> Analysis::Body(uint32_t entry) const {
+     std::vector<uint32_t> out;
+     std::set<uint32_t> seen;
+diff --git a/tools/recomp/analysis.h b/tools/recomp/analysis.h
+index 9cd65fa..da9ec72 100644
+--- a/tools/recomp/analysis.h
++++ b/tools/recomp/analysis.h
+@@ -26,6 +26,7 @@ struct Config {
+     std::string xbe_path;
+     uint32_t title = 0, entry = 0;  // the image xbe_symbols wrote the config for, 0 = unchecked
+     std::set<uint32_t> trace;       // functions whose calls and results are logged
++    std::set<uint32_t> setjmp;      // setjmp functions: the code after a call to one can resume through longjmp
+     std::string out_dir;
+     std::string library;  // the game code DLL, named in the generated exports.def
+     std::vector<std::string> code_sections;
+@@ -83,7 +84,7 @@ public:
+     std::set<uint32_t> functions;
+     std::unordered_map<uint32_t, JumpTable> jump_tables;  // keyed by jmp address
+     std::unordered_map<uint32_t, Insn> insns_;
+-    std::set<uint32_t> continuations;  // where C++ catch blocks resume, reached by the CRT's jmp eax
++    std::set<uint32_t> continuations;  // where C++ catch blocks and setjmp calls resume, reached by a jmp eax
+ 
+     // body of a function: instruction addresses reachable without entering other entries
+     std::vector<uint32_t> Body(uint32_t entry) const;
+@@ -96,6 +97,7 @@ private:
+     void Adopt(const std::vector<uint32_t>& calls, bool trusted);
+     void GapFill();
+     void EhContinuations();
++    void SetjmpContinuations();
+     void MakeFunction(uint32_t va);
+     bool ReadTable(uint32_t jmp_va, const ZydisDecodedOperand& mem, JumpTable& jt);
+     bool SledTable(uint32_t jmp_va, const uint32_t* ring, int nring, JumpTable& jt);
+diff --git a/tools/recomp/codegen_emit.cpp b/tools/recomp/codegen_emit.cpp
+index dadfc8e..58d897b 100644
+--- a/tools/recomp/codegen_emit.cpp
++++ b/tools/recomp/codegen_emit.cpp
+@@ -103,6 +103,8 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
+             ops[0].mem.segment == ZYDIS_REGISTER_FS && ops[0].mem.base == ZYDIS_REGISTER_NONE &&
+             ops[0].mem.index == ZYDIS_REGISTER_NONE && ops[0].mem.disp.value == 0)
+             seh = true;
++        const Insn* i = an_.InsnAt(va);
++        if (i && i->flow == Flow::Call && an_.cfg.setjmp.count(i->target)) seh = true;
+     }
+     std::string out;
+     out += F("X86_FUNC(__imp__%s) {\n", FuncName(entry).c_str());
+@@ -113,7 +115,7 @@ std::string CodeGen::EmitFunction(uint32_t entry) {
+     if (!entry_first) out += F("\tgoto loc_%08X;\n", entry);
+     if (labels_.count(entry) && entry_first) out += F("loc_%08X:;\n", entry);
+     out += body_;
+-    if (seh) out += "\t} catch (const X86Resume& r) {\n\t\tif (r.esp >= x86_frame) throw;\n\t\tx86_resume(ctx, base, r);\n\t}\n";
++    if (seh) out += "\t} catch (const X86Resume& r) {\n\t\tif (r.esp >= x86_frame) throw;\n\t\tx86_resume(ctx, base, r, x86_frame);\n\t}\n";
+     out += "}\n";
+     if (an_.cfg.trace.count(entry))
+         out += F("X86_TRACED_FUNC(%s, __imp__%s, 0x%XU)\n\n", FuncName(entry).c_str(), FuncName(entry).c_str(), entry);
+diff --git a/tools/recomp/main.cpp b/tools/recomp/main.cpp
+index e44391b..b3db1b8 100644
+--- a/tools/recomp/main.cpp
++++ b/tools/recomp/main.cpp
+@@ -93,6 +93,9 @@ static bool LoadConfig(const fs::path& path, Config& cfg, const fs::path& xdk_di
+     if (auto a = t["xbe"]["code_prefixes"].as_array())
+         for (auto& i : *a)
+             if (auto s = i.value<std::string>()) cfg.code_prefixes.push_back(*s);
++    if (auto a = t["xbe"]["setjmp"].as_array())
++        for (auto& i : *a)
++            if (auto v = i.value<int64_t>()) cfg.setjmp.insert(uint32_t(*v));
+     if (auto a = t["xbe"]["data_ranges"].as_array())
+         for (auto& i : *a)
+             if (auto r = i.as_array(); r && r->size() == 2)
+diff --git a/xdk/4928/layout.toml b/xdk/4928/layout.toml
+new file mode 100644
+index 0000000..cc4cb46
+--- /dev/null
++++ b/xdk/4928/layout.toml
+@@ -0,0 +1,52 @@
++# XDK 4831 library data layouts the runtime reads or writes. Each value is proven by the default.xbe
++# (007: NightFire) code at the address given; Driving.xbe (same 4831 libraries) matches.
++[layout]
++# D3D8 CDevice, the static device D3D__pDevice points at; its miniport is at +0x23C0 (the device init 0x105B5F)
++CDevice_Push              = 0x0    # D3DDevice_SetTexture 0x103F02 reads it, compares with +4, calls MakeSpace 0x106910
++CDevice_PushThreshold     = 0x4    # D3DDevice_SetTexture 0x103F05 compares the push pointer with it
++CDevice_BaseVertex        = 0x1C   # D3DDevice_SetIndices 0x1040B9 stores BaseVertexIndex
++CDevice_IndexBuffer       = 0x38C  # D3DDevice_SetIndices 0x10408A reads the old one, 0x1040B2 stores the new one
++CDevice_ZScale            = 0x510  # D3DDevice_GetViewportOffsetAndScale 0x1006D5 scales the Z range by it
++CDevice_SuperSampleX      = 0x518  # D3DDevice_GetViewportOffsetAndScale 0x10062E scales viewport X by it
++CDevice_SuperSampleY      = 0x51C  # D3DDevice_GetViewportOffsetAndScale 0x100650 scales viewport Y by it
++CDevice_Transforms        = 0x810  # D3DDevice_SetTransform 0x103996 copies 16 dwords to +0x810 + type * 64
++CDevice_Textures          = 0xB38  # D3DDevice_SetTexture 0x103EC0 reads, 0x103EF9 stores [stage]
++CDevice_Palettes          = 0xB48  # Driving.xbe D3DDevice_SetPalette 0x1669ED reads, 0x166A25 stores [stage]
++CDevice_RenderTarget      = 0x21B4 # D3DDevice_GetRenderTarget2 0x103D16 returns it
++CDevice_Depth             = 0x21B8 # D3DDevice_GetDepthStencilSurface2 0x103D36 returns it
++CDevice_BackBuffer        = 0x21C0 # D3DDevice_GetBackBuffer2 0x103C80 returns it for index 0
++CDevice_FrontBuffer       = 0x21C4 # D3DDevice_GetBackBuffer2 0x103C65 returns it for index -1
++CDevice_SwapCount         = 0x2C10 # D3DDevice_Swap 0x103790 increments it, 0x103801 returns it
++CDevice_Size              = 0x2C30 # Direct3D_CreateDevice 0x10051B clears 0xB0C dwords of the device on failure
++CDevice_Flags             = 0x8    # Direct3D_CreateDevice 0x1004DE ors BehaviorFlags & 0x10 into it, D3DDevice_SetPixelShader 0x10A111 tests that bit
++CDevice_Time              = 0x30   # D3D_SetFence 0x1065BD pushes it, 0x106633 adds 2
++CDevice_PixelShader       = 0x370  # D3DDevice_SetPixelShader 0x10A048 stores the handle
++CDevice_VertexShader      = 0x380  # the device init 0x105F18 stores the FVF shader object 0x111E40, D3DDevice_SetVertexShader 0x102BB8 the current one
++CDevice_BackBufferScale   = 0x528  # the frame buffer init 0x10562A stores the X scale as a float, 0x105643 the Y scale at +4
++CDevice_Viewport          = 0xA90  # D3DDevice_SetViewport 0x103E4B to 0x103E6F stores X, Y, Width, Height, MinZ, MaxZ
++CDevice_ScreenSpaceOffset = 0xAA8  # D3DDevice_SetScreenSpaceOffset 0x1043A3 stores x + 0.53125, 0x1043B3 y + 0.53125 at +4
++CDevice_AutoDepth         = 0x21CC # the frame buffer init 0x1059DF stores the depth buffer, the device init 0x105F43 reads it
++CDevice_VBlankCallback    = 0x2550 # the vertical blank handler 0x10B2AE calls [miniport + 0x190]
++CDevice_VBlankEvent       = 0x2554 # D3DDevice_BlockUntilVerticalBlank 0x103ABD waits on it, 0x103AAB clears its SignalState
++CDevice_DisplayFlags      = 0x2574 # D3DDevice_GetDisplayMode 0x103C08 reads it (0x400000 = 60 Hz), the vertical blank handler 0x10B24D tests miniport + 0x1B4
++CDevice_VBlankCount       = 0x2580 # the vertical blank handler 0x10B204 to 0x10B211 increments miniport + 0x1C0
++CDevice_Field             = 0x2590 # the vertical blank handler 0x10B274 stores the field at miniport + 0x1D0
++CDevice_GammaRamps        = 0x259C # D3DDevice_SetGammaRamp 0x103933 copies to miniport + 0x1DC + index * 0x300
++CDevice_GammaPending      = 0x2B9C # D3DDevice_SetGammaRamp 0x103961 sets [miniport + 0x7DC + index * 4]
++# D3D8 globals
++DirtyFlags_Texture        = 0x4800 # D3DDevice_SetTexture 0x103F37 ors it into D3D__DirtyFlags
++TextureState_Stage        = 32     # D3DDevice_SetTextureStageStateNotInline 0x10106C: [stage * 32 + type] dwords
++Stream_Size               = 12     # D3DDevice_SetStreamSource 0x1027BA indexes the stream table by n * 12
++Stream_Stride             = 0x0    # D3DDevice_SetStreamSource 0x102802 stores Stride
++Stream_Buffer             = 0x8    # D3DDevice_SetStreamSource 0x102808 stores the vertex buffer
++PixelShader_Definition    = 0x8    # D3DDevice_SetPixelShader 0x10A0B0 reads the definition pointer; Driving.xbe D3DDevice_CreatePixelShader 0x16AF11 stores it
++# DSOUND
++CDirectSoundStream_Vtable  = 0x0   # CDirectSoundStream constructor 0x11427E stores the first vtable
++CDirectSoundStream_Vtable2 = 0x4   # CDirectSoundStream constructor 0x114277 stores the second vtable
++EffectsImage_Skip0         = 0x804 # 0x115711 (reached from CDirectSound_DownloadEffectsImage 0x112892) adds this dword count
++EffectsImage_Skip1         = 0x80C # 0x11570B loads this dword count
++EffectsImage_Desc          = 0x818 # 0x11571A: descriptor at image + 0x818 + (Skip0 + Skip1) * 4
++# XAPI XPP device type record
++XPP_Current               = 0x0    # XGetDevices 0x158142 returns it
++XPP_Changed               = 0x4    # XGetDevices 0x158144 clears it, XGetDeviceChanges 0x158162 tests it
++XPP_Previous              = 0x8    # XGetDevices 0x15814A copies Current into it
+diff --git a/xdk/4928/signatures.toml b/xdk/4928/signatures.toml
+new file mode 100644
+index 0000000..c8e5d06
+--- /dev/null
++++ b/xdk/4928/signatures.toml
+@@ -0,0 +1,285 @@
++# XDK library signatures read by xbe_symbols, written by xbe_symbols in sign mode. No library bytes stored.
++# [symbols] name = {sec, len, hash, calls, deep, count, nth}: hash of len bytes from the function start in
++# section sec, image addresses and rel32 targets masked; calls = [len, hash, calls] of each rel32 call or
++# jump target outside it, in order, two levels deep; deep = lookalikes exist, so the callees' callees must
++# match too; count and nth pick one of identical functions by link order; xtlid = its .XTLID export id,
++# used when the bytes match nothing. {} = no signature, stays 0.
++# k = its constants, sorted: immediates and displacements of instructions that do not use the stack, when
++# not an image address, a branch target or below 0x40; an address inside .text counts in a library section,
++# which holds no such pointer. ret = stack bytes its rets pop, regs = registers it reads before it writes
++# them. A function the bytes do not find is matched by k; ret and regs then show a changed convention.
++# [anchors] functions only used to find data. [data] in = function, insn = instruction index, op = operand,
++# deref = offsets of the dwords then read in turn, for data behind a table, xtlid = the id .XTLID lists the
++# address under, used when in finds nothing.
++
++[symbols]
++BinkDoFrame = {}
++BinkGetSummary = {}
++BinkNextFrame = {}
++BinkWait = {}
++CDevice_KickOff = {sec = "D3D", len = 0xE3, hash = "0xEBBAF49BF9A48A6B", calls = [[0x34, "0x97C6CFAEFCD6771C", []]], k = [0x40, 0x40, 0x40, 0x40, 0x44, 0x35C, 0x2000, 0x23BC, 0x23BC, 0x23BC, 0x23BC, 0x23C0, 0x257C, 0x2BD8, 0x2C10, 0xFFFFFFF, 0xFFFFFFF], ret = 0, regs = ["ecx"]}
++CDirectSoundStream_AddRef = {sec = "DSOUND", len = 0x47, hash = "0x38BA55285D0DEB0F", calls = [[0x1E, "0x77CF69460E7107DD", []]], k = [0x80004005], ret = 4, regs = []}
++CDirectSoundStream_Discontinuity = {sec = "DSOUND", len = 0x4D, hash = "0x9DAC564EADCFB54", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x2F, "0x10FD26F6273461B5", [[0x18, "0x6A800CF975C06791"], [0x4, "0x7C528B01F97475C1"], [0x39, "0x7FC597D868C6CAE"]]]], k = [0x80004005], ret = 4, regs = []}
++CDirectSoundStream_Flush = {sec = "DSOUND", len = 0x4D, hash = "0x9DAC564EADCFB54", calls = [[0x1E, "0x77CF69460E7107DD", []], [0xD3, "0xD99F72317DA1456E", [[0x33, "0x7CF2BAB09D97F050"], [0xC5, "0x7C6C587E3DEB9120"], [0x130, "0x7DE564349A0FC786"], [0x17, "0x7E2C3744D63891F6"], [0x1C, "0xB47831EEA01CBE7B"], [0x76, "0x67DAB6D607D44012"], [0x40, "0x5F3E2C04D1A7FC52"], [0x28, "0xFC13F8068ED4B854"]]]], k = [0x80004005], ret = 4, regs = []}
++CDirectSoundStream_FlushEx = {}
++CDirectSoundStream_GetInfo = {sec = "DSOUND", len = 0x67, hash = "0x1E4E16EF303ED7B2", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x23, "0x96E46A1F4800077F", []]], k = [0x80004005], ret = 8, regs = []}
++CDirectSoundStream_GetStatus = {sec = "DSOUND", len = 0x51, hash = "0xD83AF4801D8A8A83", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x51, "0x156D6A71E9EE7BFE", []]], k = [0x80004005], ret = 8, regs = []}
++CDirectSoundStream_Pause = {sec = "DSOUND", len = 0x51, hash = "0xD83AF4801D8A8A83", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x8E, "0x3074357C4DB37916", [[0xAE, "0xBC832F3D445807C2"], [0xE6, "0xF5CBED015F93B233"], [0xE6, "0xF5CBED015F93B233"]]]], k = [0x80004005], ret = 8, regs = []}
++CDirectSoundStream_Process = {sec = "DSOUND", len = 0x77, hash = "0xAD7969B067281366", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x51, "0x156D6A71E9EE7BFE", []], [0xC7, "0x16E76B6E873DEA2F", [[0x1E, "0x42AB97AE89C70500"], [0x4, "0x7CA41B01F9B9C199"], [0x17C, "0xF7A865C1547618CE"], [0x33, "0x7CF2BAB09D97F050"], [0x1F, "0xD1EBB22741D550CD"], [0x17, "0x7E2C3744D63891F6"], [0x33, "0x7CF2BAB09D97F050"], [0x17, "0x7E2C3744D63891F6"], [0xAE, "0xBC832F3D445807C2"]]]], k = [0x80004005, 0x88780032], ret = 12, regs = []}
++CDirectSoundStream_Release = {sec = "DSOUND", len = 0x4E, hash = "0xB7724C9F86CABB4A", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x23, "0xC107B1971FF8951E", []]], k = [0x80004005], ret = 4, regs = []}
++CDirectSoundStream_SetFilter = {}
++CDirectSoundStream_SetFormat = {}
++CDirectSoundStream_SetFrequency = {}
++CDirectSoundStream_SetHeadroom = {}
++CDirectSoundStream_SetI3DL2Source = {}
++CDirectSoundStream_SetMaxDistance = {}
++CDirectSoundStream_SetMinDistance = {}
++CDirectSoundStream_SetMixBinVolumes = {}
++CDirectSoundStream_SetMixBins = {}
++CDirectSoundStream_SetPitch = {sec = "DSOUND", len = 0x52, hash = "0xD67AF17BD694BB31", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x19, "0xCEC36E92D765A281", [[0x92, "0x86481E6B66EDAC0C"]]]], k = [0x80004005], ret = 8, regs = []}
++CDirectSoundStream_SetPosition = {}
++CDirectSoundStream_SetVelocity = {}
++CDirectSoundStream_SetVolume = {sec = "DSOUND", len = 0x52, hash = "0xD67AF17BD694BB31", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x1C, "0xFC6E09B4AD4AB568", [[0x98, "0xFC9BB13430B7D587"]]]], k = [0x80004005], ret = 8, regs = []}
++D3DDevice_Begin = {sec = "D3D", len = 0x35, hash = "0xC578D9AD869E942C", calls = [[0x7A, "0xB300E4ACD2FBCEA4", [[0x165, "0x5BDD8B638614CE08"], [0xBE, "0x33DAC30F8709DAC6"], [0x158, "0xD793C2C2AA2CF382"], [0x1E2, "0xAF2910E41E98AFBA"], [0x1DA, "0xDD972AC5AE5F84DA"], [0x383, "0x3933BF3D915841EE"], [0x33A, "0xBEAD4FC1B91502BA"], [0x1F3, "0x5B81579760ACEB80"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x800, 0x417FC], ret = 4, regs = []}
++D3DDevice_BeginPush = {}
++D3DDevice_BlockOnFence = {}
++D3DDevice_BlockUntilVerticalBlank = {sec = "D3D", len = 0x24, hash = "0x179C474D1F331B35", k = [0x2554, 0x2558], ret = 0, regs = []}
++D3DDevice_Clear = {sec = "D3D", len = 0x39C, hash = "0x3A6A120241FEB7ED", calls = [[0x16, "0x1DBD5577E019815D", []], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x100, 0x518, 0x518, 0x51C, 0x51C, 0xA90, 0xA94, 0xA98, 0xA9C, 0x21B4, 0x21B8, 0x40208, 0x40208, 0x81D98, 0xC1D8C, 0xFFFFFDFF], ret = 24, regs = []}
++D3DDevice_CopyRects = {}
++D3DDevice_CreatePixelShader = {}
++D3DDevice_CreateVertexShader = {sec = "D3D", len = 0x13E, hash = "0xE85EA7499B6640D6", calls = [[0xF7, "0xD1E6B62F3D388EE7", []], [0x1D, "0x345B18AE6CE600A0", [[0x79B, "0xE33AB46FD1CDB1C3"]]], [0x199, "0xEAFF2E1A5A27F36F", []], [0x68, "0x48B54173CEF6CCA6", []], [0xF7, "0xD1E6B62F3D388EE7", []]], k = [0x46, 0x7F, 0x114, 0x114, 0x114, 0x118, 0x2078, 0x7378, 0x8007000E], ret = 16, regs = []}
++D3DDevice_DeletePixelShader = {}
++D3DDevice_DeleteVertexShader = {}
++D3DDevice_DrawIndexedVertices = {sec = "D3D", len = 0x267, hash = "0x96C678DDEF9BAC9", calls = [[0x191, "0xF6798E031DA75BC1", [[0x7A, "0xB300E4ACD2FBCEA4"], [0xF, "0x992EC001666B3982"]]], [0x3E, "0x2209BC66D6C09264", [[0x173, "0xD1EB123489248CDA"]]], [0x3E, "0x2209BC66D6C09264", [[0x173, "0xD1EB123489248CDA"]]], [0xAD, "0x65BC38CE726F47AC", [[0x173, "0xD1EB123489248CDA"], [0xE3, "0xEBBAF49BF9A48A6B"]]]], k = [0x40, 0x40, 0x40, 0x40, 0x5C, 0x60, 0x1FF, 0x1FF, 0x3FE, 0x3FE, 0x800, 0x417FC, 0x417FC, 0x41808, 0x40001800, 0x40001800, 0x40001800, 0xFFFFE7FF], ret = 12, regs = []}
++D3DDevice_DrawVertices = {sec = "D3D", len = 0x9F, hash = "0x9A207A4E6EE2DC0C", calls = [[0x191, "0xF6798E031DA75BC1", [[0x7A, "0xB300E4ACD2FBCEA4"], [0xF, "0x992EC001666B3982"]]], [0x3E, "0x2209BC66D6C09264", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x100, 0x100, 0x100, 0x417FC, 0x417FC, 0x40001810, 0xFF000000, 0xFFFFFEFF], ret = 12, regs = []}
++D3DDevice_DrawVerticesUP = {}
++D3DDevice_EnableOverlay = {}
++D3DDevice_End = {sec = "D3D", len = 0x3D, hash = "0x8399607A7E8EA565", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0xAD, "0x65BC38CE726F47AC", [[0x173, "0xD1EB123489248CDA"], [0xE3, "0xEBBAF49BF9A48A6B"]]]], k = [0x417FC, 0xFFFFE7FF], ret = 0, regs = []}
++D3DDevice_EndPush = {}
++D3DDevice_FlushVertexCache = {}
++D3DDevice_GetBackBuffer2 = {sec = "D3D", len = 0x43, hash = "0x98CB0C3795F52E34", calls = [[0x37, "0x4DD4FEAA2A7C506E", []], [0x37, "0x4DD4FEAA2A7C506E", []]], k = [0x21C0, 0x21C0], ret = 4, regs = []}
++D3DDevice_GetDepthStencilSurface2 = {sec = "D3D", len = 0x1E, hash = "0xE9197213B86373B", calls = [[0x37, "0x4DD4FEAA2A7C506E", []]], k = [0x21B8], ret = 0, regs = []}
++D3DDevice_GetRasterStatus = {sec = "D3D", len = 0x6B, hash = "0xA0157E236749345A", k = [0x4FC, 0x7FF, 0xFFF, 0x21C4], ret = 4, regs = []}
++D3DDevice_GetRenderTarget2 = {sec = "D3D", len = 0x1A, hash = "0x260301336BB8F0C0", calls = [[0x37, "0x4DD4FEAA2A7C506E", []]], k = [0x21B4], ret = 0, regs = []}
++D3DDevice_GetTile = {}
++D3DDevice_GetVertexShaderFunction = {}
++D3DDevice_InsertFence = {}
++D3DDevice_IsFencePending = {}
++D3DDevice_LightEnable = {}
++D3DDevice_LoadVertexShader = {sec = "D3D", len = 0x55, hash = "0xD0A9914C5B4C42E3", calls = [[0xAA, "0xFE0CBE120FBF0F13", []], [0x3E, "0x2209BC66D6C09264", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x114, 0x41E9C], ret = 8, regs = []}
++D3DDevice_LoadVertexShaderProgram = {}
++D3DDevice_MakeSpace = {sec = "D3D", len = 0xF, hash = "0x992EC001666B3982", calls = [[0x173, "0xD1EB123489248CDA", [[0x136, "0x2921BD57A8629C9E"], [0xE3, "0xEBBAF49BF9A48A6B"], [0xAD, "0x65BC38CE726F47AC"], [0xE3, "0xEBBAF49BF9A48A6B"]]]], ret = 0, regs = []}
++D3DDevice_PersistDisplay = {}
++D3DDevice_Release = {}
++D3DDevice_Reset = {}
++D3DDevice_RunPushBuffer = {}
++D3DDevice_SelectVertexShader = {sec = "D3D", len = 0x80, hash = "0x8086C30047D3C3E1", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x1E5, "0x3A2E5DF5855DE0AB", [[0x125, "0xC4B1A5A400F19D91"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x380, 0x384, 0x388, 0x1070, 0x41EA0, 0x81E94], ret = 8, regs = []}
++D3DDevice_SetFlickerFilter = {sec = "D3D", len = 0x42, hash = "0x4967F24AD9A579CC", k = [0x23C0], ret = 4, regs = []}
++D3DDevice_SetGammaRamp = {sec = "D3D", len = 0x83, hash = "0x2DDA12F4EE7919C3", calls = [[0x59, "0x8346A1C371490F0A", []]], k = [0xC0, 0xC0, 0x1DC, 0x1DC, 0x7DC, 0x7E4, 0x23C0, 0x2BA4, 0x2C10], ret = 8, regs = []}
++D3DDevice_SetIndices = {sec = "D3D", len = 0x84, hash = "0xCC0D5E23C9B83A9A", calls = [[0x9C, "0x3E127CEF6093DFB6", [[0x78, "0x99A9873B5DD90A04"], [0x46, "0x60BEFA9047E0FC04"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"]]]], k = [0x38C, 0x38C, 0x38C, 0x38C, 0x80000, 0xFFF80000], ret = 8, regs = []}
++D3DDevice_SetLight = {}
++D3DDevice_SetMaterial = {}
++D3DDevice_SetPalette = {sec = "D3D", len = 0x8D, hash = "0xFB252D194CD6A40B", calls = [[0x9C, "0x3E127CEF6093DFB6", [[0x78, "0x99A9873B5DD90A04"], [0x46, "0x60BEFA9047E0FC04"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0xB48, 0xB48, 0xB48, 0x41B20, 0x80000, 0xFFF80000], ret = 8, regs = []}
++D3DDevice_SetPixelShader = {sec = "D3D", len = 0x1F3, hash = "0x19180FFE3A52EBB7", calls = [[0x51, "0x5C7E9BC222FC9004", [[0xF, "0x992EC001666B3982"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x4F, "0xFADA43A8E41D4054", []], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x4F, "0xFADA43A8E41D4054", []]], k = [0xA8, 0xA8, 0xAC, 0xAC, 0xB0, 0xB0, 0xB4, 0xB4, 0xB8, 0xBC, 0xC0, 0xD8, 0xD8, 0xDC, 0xE0, 0xE4, 0xE8, 0xEC, 0xEC, 0xF0, 0xF0, 0xF4, 0xF8, 0xFC, 0x100, 0x370, 0x370, 0x374, 0x374, 0x374, 0x374, 0x378, 0x37C, 0x2000, 0x2000, 0x4000, 0x4800, 0x417F8, 0x41E78, 0x80288, 0x81E20, 0x81E74], ret = 4, regs = []}
++D3DDevice_SetPixelShaderConstant = {}
++D3DDevice_SetRenderStateNotInline = {sec = "D3D", len = 0x5D, hash = "0xA914C7CD799F4C2E", calls = [[0x27, "0xFD83B1F6F3776DB0", [[0xF, "0x992EC001666B3982"]]]], k = [0x5C, 0x88], ret = 8, regs = []}
++D3DDevice_SetRenderState_BackFillMode = {sec = "D3D", len = 0x51, hash = "0xBC78C06F8285CC04", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x8038C], ret = 4, regs = []}
++D3DDevice_SetRenderState_CullMode = {sec = "D3D", len = 0x68, hash = "0x41E41F4067D70FAB", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x404, 0x40308, 0x4039C], ret = 4, regs = []}
++D3DDevice_SetRenderState_DoNotCullUncompressed = {sec = "D3D", len = 0x11, hash = "0x4F7F4A773101B2F1", count = 3, nth = 2, deep = true, calls = [[0xCE, "0x1067F598F5F68214", [[0xF, "0x992EC001666B3982"]]]], ret = 4, regs = []}
++D3DDevice_SetRenderState_Dxt1NoiseEnable = {sec = "D3D", len = 0x77, hash = "0x20F72AA701A9B6AF", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x21B4, 0x40100, 0x40110], ret = 4, regs = []}
++D3DDevice_SetRenderState_EdgeAntiAlias = {sec = "D3D", len = 0x32, hash = "0x730A89937FD22F33", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x80320], ret = 4, regs = []}
++D3DDevice_SetRenderState_FillMode = {sec = "D3D", len = 0x44, hash = "0xF4CFF32CF2609D44", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x8038C], ret = 4, regs = []}
++D3DDevice_SetRenderState_FogColor = {sec = "D3D", len = 0x4D, hash = "0x1B01BAE4601E76CF", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0xFF, 0x402A8, 0xFF00FF00], ret = 4, regs = []}
++D3DDevice_SetRenderState_FrontFace = {sec = "D3D", len = 0x3A, hash = "0x9BC97623E21CE0ED", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x68, "0x41E41F4067D70FAB", [[0xF, "0x992EC001666B3982"]]]], k = [0x403A0], regs = []}
++D3DDevice_SetRenderState_LineWidth = {sec = "D3D", len = 0x65, hash = "0x17E6BEBBBD67538B", calls = [[0x9, "0x5AE13FDFB3B6A4DF", []], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x1FF, 0x1FF, 0x520, 0x40380], ret = 4, regs = []}
++D3DDevice_SetRenderState_LogicOp = {sec = "D3D", len = 0x52, hash = "0x9B9DDE0E59AC0F69", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x417BC, 0x817BC], ret = 4, regs = []}
++D3DDevice_SetRenderState_MultiSampleAntiAlias = {sec = "D3D", len = 0x72, hash = "0x989803ED63A0611F", calls = [[0xF1, "0x8BCA5E56FE192FCB", [[0x3E, "0x2209BC66D6C09264"], [0x68, "0x48B54173CEF6CCA6"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x1E5, "0x3A2E5DF5855DE0AB", [[0x125, "0xC4B1A5A400F19D91"]]]], k = [0x41D7C], ret = 4, regs = []}
++D3DDevice_SetRenderState_MultiSampleMask = {sec = "D3D", len = 0x50, hash = "0x7C55605975C92203", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x41D7C], ret = 4, regs = []}
++D3DDevice_SetRenderState_MultiSampleMode = {sec = "D3D", len = 0x34, hash = "0xE7734FF5C0E96C43", calls = [[0x54A, "0xD6CA4BE9BD7089C3", [[0x5C, "0x23CABB00661424AB"], [0x5C, "0x23CABB00661424AB"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x16, "0x1DBD5577E019815D"], [0x32, "0x79A41FE5E122B9C"], [0x62, "0x39DF67CEF83C99D2"], [0x62, "0x39DF67CEF83C99D2"], [0x32, "0x79A41FE5E122B9C"], [0x12, "0x3CF97E0F4C449D89"], [0xF, "0x992EC001666B3982"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x5D, "0xA914C7CD799F4C2E"], [0xF1, "0x8BCA5E56FE192FCB"], [0x160, "0xE92CD588CDB2EF12"], [0x77, "0x20F72AA701A9B6AF"]]]], k = [0xA90, 0x21B4, 0x21B8, 0x21C0], ret = 4, regs = []}
++D3DDevice_SetRenderState_MultiSampleRenderTargetMode = {sec = "D3D", len = 0x34, hash = "0xC0CBA6BA037F81E2", calls = [[0x54A, "0xD6CA4BE9BD7089C3", [[0x5C, "0x23CABB00661424AB"], [0x5C, "0x23CABB00661424AB"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x16, "0x1DBD5577E019815D"], [0x32, "0x79A41FE5E122B9C"], [0x62, "0x39DF67CEF83C99D2"], [0x62, "0x39DF67CEF83C99D2"], [0x32, "0x79A41FE5E122B9C"], [0x12, "0x3CF97E0F4C449D89"], [0xF, "0x992EC001666B3982"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x5D, "0xA914C7CD799F4C2E"], [0xF1, "0x8BCA5E56FE192FCB"], [0x160, "0xE92CD588CDB2EF12"], [0x77, "0x20F72AA701A9B6AF"]]]], k = [0xA90, 0x21B4, 0x21B8, 0x21C0], ret = 4, regs = []}
++D3DDevice_SetRenderState_NormalizeNormals = {sec = "D3D", len = 0x39, hash = "0x1289F499D4F87D6B", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x200, 0x403A4], ret = 4, regs = []}
++D3DDevice_SetRenderState_OcclusionCullEnable = {sec = "D3D", len = 0x62, hash = "0x19BF8BE1EEFC19CA", count = 2, nth = 0, deep = true, calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x1E00, 0x41D84], ret = 4, regs = []}
++D3DDevice_SetRenderState_PSTextureModes = {sec = "D3D", len = 0x22, hash = "0x76CA283CBFFE6419", k = [0x37C, 0x4000], ret = 4, regs = []}
++D3DDevice_SetRenderState_RopZCmpAlwaysRead = {sec = "D3D", len = 0x11, hash = "0x4F7F4A773101B2F1", count = 3, nth = 0, deep = true, calls = [[0xCE, "0x1067F598F5F68214", [[0xF, "0x992EC001666B3982"]]]], ret = 4, regs = []}
++D3DDevice_SetRenderState_RopZRead = {sec = "D3D", len = 0x11, hash = "0x4F7F4A773101B2F1", count = 3, nth = 1, deep = true, calls = [[0xCE, "0x1067F598F5F68214", [[0xF, "0x992EC001666B3982"]]]], ret = 4, regs = []}
++D3DDevice_SetRenderState_SampleAlpha = {sec = "D3D", len = 0x4E, hash = "0x9D28589E68B988EC", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x41D7C], ret = 4, regs = []}
++D3DDevice_SetRenderState_ShadowFunc = {sec = "D3D", len = 0x35, hash = "0xF346C616C28FF5C3", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x41E6C, 0xFFFFFE00], ret = 4, regs = []}
++D3DDevice_SetRenderState_Simple = {sec = "D3D", len = 0x27, hash = "0xFD83B1F6F3776DB0", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], ret = 0, regs = ["ecx", "edx"]}
++D3DDevice_SetRenderState_StencilCullEnable = {sec = "D3D", len = 0x62, hash = "0x19BF8BE1EEFC19CA", count = 2, nth = 1, deep = true, calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x1E00, 0x41D84], ret = 4, regs = []}
++D3DDevice_SetRenderState_StencilEnable = {sec = "D3D", len = 0x84, hash = "0x6F7C5EBA955005A9", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x1E00, 0x21B8, 0x4032C, 0x41D84], ret = 4, regs = []}
++D3DDevice_SetRenderState_StencilFail = {sec = "D3D", len = 0x6D, hash = "0x1AC579E0A6FC138", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x1E00, 0x40370, 0x41D84], ret = 4, regs = []}
++D3DDevice_SetRenderState_TextureFactor = {sec = "D3D", len = 0x51, hash = "0x5C7E9BC222FC9004", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x370], ret = 4, regs = []}
++D3DDevice_SetRenderState_TwoSidedLighting = {sec = "D3D", len = 0x63, hash = "0x489366A275331CEF", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x1000, 0x8038C], ret = 4, regs = []}
++D3DDevice_SetRenderState_VertexBlend = {sec = "D3D", len = 0x41, hash = "0x9009C90948A65018", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x200, 0x40328], ret = 4, regs = []}
++D3DDevice_SetRenderState_YuvEnable = {sec = "D3D", len = 0x2B, hash = "0x9F44B45404A3EE4B", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x59, "0xAEA17192EF341587", []]], ret = 4, regs = []}
++D3DDevice_SetRenderState_ZEnable = {sec = "D3D", len = 0x8F, hash = "0x39499B95AD5BB2E4", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x140, "0xC081BB8DEB5DCB72", [[0xFA, "0xFB0FEB1CD8F3F37D"]]], [0xF1, "0x8BCA5E56FE192FCB", [[0x3E, "0x2209BC66D6C09264"], [0x68, "0x48B54173CEF6CCA6"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x59, "0xAEA17192EF341587", []], [0x1E5, "0x3A2E5DF5855DE0AB", [[0x125, "0xC4B1A5A400F19D91"]]]], k = [0x21B8, 0x4030C, 0x41D78], ret = 4, regs = []}
++D3DDevice_SetRenderTarget = {sec = "D3D", len = 0x17, hash = "0xE2DB1972025BA6B2", calls = [[0x54A, "0xD6CA4BE9BD7089C3", [[0x5C, "0x23CABB00661424AB"], [0x5C, "0x23CABB00661424AB"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x16, "0x1DBD5577E019815D"], [0x32, "0x79A41FE5E122B9C"], [0x62, "0x39DF67CEF83C99D2"], [0x62, "0x39DF67CEF83C99D2"], [0x32, "0x79A41FE5E122B9C"], [0x12, "0x3CF97E0F4C449D89"], [0xF, "0x992EC001666B3982"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x5D, "0xA914C7CD799F4C2E"], [0xF1, "0x8BCA5E56FE192FCB"], [0x160, "0xE92CD588CDB2EF12"], [0x77, "0x20F72AA701A9B6AF"]]]], ret = 8, regs = []}
++D3DDevice_SetRenderTargetFast = {}
++D3DDevice_SetScissors = {sec = "D3D", len = 0x197, hash = "0x3FE0B249528CD165", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []]], k = [0x518, 0x51C, 0xA90, 0xA94, 0xA98, 0xA9C, 0x2320, 0x23A0, 0x23A4, 0x402B4, 0x402E0], ret = 12, regs = []}
++D3DDevice_SetScreenSpaceOffset = {sec = "D3D", len = 0x49, hash = "0x9FC9CCB594250450", calls = [[0xF1, "0x8BCA5E56FE192FCB", [[0x3E, "0x2209BC66D6C09264"], [0x68, "0x48B54173CEF6CCA6"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x1E5, "0x3A2E5DF5855DE0AB", [[0x125, "0xC4B1A5A400F19D91"]]]], k = [0xAA8, 0xAAC], ret = 8, regs = []}
++D3DDevice_SetShaderConstantMode = {sec = "D3D", len = 0xF5, hash = "0x4018769ECF3DBA08", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x70, "0x7D9C5AF64969EA58", []], [0x70, "0x7D9C5AF64969EA58", []], [0x70, "0x7D9C5AF64969EA58", []], [0x70, "0x7D9C5AF64969EA58", []]], k = [0x44, 0x88, 0xCC, 0x110, 0x114, 0x118, 0x11C, 0x120, 0x124, 0x200, 0x1600, 0x20D8, 0x41EA4, 0x3F800000, 0xFFFFFDFF], ret = 4, regs = []}
++D3DDevice_SetSoftDisplayFilter = {sec = "D3D", len = 0x51, hash = "0xDB157F30148DAB9A", k = [0x23C0], ret = 4, regs = []}
++D3DDevice_SetStreamSource = {sec = "D3D", len = 0x8C, hash = "0xD1BC3117B5D1D30C", calls = [[0x9C, "0x3E127CEF6093DFB6", [[0x78, "0x99A9873B5DD90A04"], [0x46, "0x60BEFA9047E0FC04"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"]]]], k = [0x40, 0x70, 0x80000, 0xFFF80000], ret = 12, regs = []}
++D3DDevice_SetTexture = {sec = "D3D", len = 0x1A4, hash = "0x90388D915345CE63", calls = [[0x9C, "0x3E127CEF6093DFB6", [[0x78, "0x99A9873B5DD90A04"], [0x46, "0x60BEFA9047E0FC04"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x360, 0x800, 0xB38, 0xB38, 0xFFF, 0xFFF, 0x206C, 0x20F4, 0x2A00, 0x3100, 0x4000, 0x4800, 0xFF00, 0x41B0C, 0x41B0C, 0x41B10, 0x41B1C, 0x80000, 0x40000000, 0x80000000, 0xFFF80000, 0xFFFFDFFF], ret = 8, regs = []}
++D3DDevice_SetTextureStageStateNotInline = {sec = "D3D", len = 0xEC, hash = "0x52377A3E3E06600C", calls = [[0x105, "0x27A4472C813FF429", [[0xF, "0x992EC001666B3982"]]], [0x3D, "0xAD4A3146467D1DCD", [[0xF, "0x992EC001666B3982"]]], [0x39, "0xA293CC3B791733F7", [[0xF, "0x992EC001666B3982"]]], [0x63, "0x6E8A3692C91471EB", [[0xF, "0x992EC001666B3982"]]]], k = [0x480F, 0xFFFFBFF1], ret = 12, regs = []}
++D3DDevice_SetTextureState_BorderColor = {sec = "D3D", len = 0x3D, hash = "0xAD4A3146467D1DCD", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x41B24], ret = 8, regs = []}
++D3DDevice_SetTextureState_BumpEnv = {sec = "D3D", len = 0x63, hash = "0x6E8A3692C91471EB", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x370, 0x41AD0], ret = 12, regs = []}
++D3DDevice_SetTextureState_ColorKeyColor = {sec = "D3D", len = 0x39, hash = "0xA293CC3B791733F7", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x40AE0], ret = 8, regs = []}
++D3DDevice_SetTextureState_TexCoordIndex = {sec = "D3D", len = 0x105, hash = "0x27A4472C813FF429", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x200, 0x47F, 0x514, 0x514, 0x514, 0x2400, 0x2401, 0x8511, 0x8512, 0xC03C, 0x30000, 0x41964, 0xFF000000, 0xFFFF0000], ret = 8, regs = []}
++D3DDevice_SetTile = {}
++D3DDevice_SetTransform = {sec = "D3D", len = 0x10E, hash = "0xAEDF2475629B178A", calls = [[0x140, "0xC081BB8DEB5DCB72", [[0xFA, "0xFB0FEB1CD8F3F37D"]]], [0xF1, "0x8BCA5E56FE192FCB", [[0x3E, "0x2209BC66D6C09264"], [0x68, "0x48B54173CEF6CCA6"]]]], k = [0x44, 0x44, 0x44, 0x44, 0x44, 0x504, 0x504, 0x508, 0x508, 0x508, 0x50C, 0x810, 0x3F800000], ret = 8, regs = []}
++D3DDevice_SetVertexShader = {sec = "D3D", len = 0x152, hash = "0xE33C34218A33DCEC", calls = [[0x139, "0x59D35C41E6742F40", []], [0x55, "0xD0A9914C5B4C42E3", [[0xAA, "0xFE0CBE120FBF0F13"], [0x3E, "0x2209BC66D6C09264"]]], [0x80, "0x8086C30047D3C3E1", [[0xF, "0x992EC001666B3982"], [0x1E5, "0x3A2E5DF5855DE0AB"], [0xF, "0x992EC001666B3982"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x1E5, "0x3A2E5DF5855DE0AB", [[0x125, "0xC4B1A5A400F19D91"]]], [0xF1, "0x8BCA5E56FE192FCB", [[0x3E, "0x2209BC66D6C09264"], [0x68, "0x48B54173CEF6CCA6"]]], [0x1E5, "0x3A2E5DF5855DE0AB", [[0x125, "0xC4B1A5A400F19D91"]]]], k = [0x70, 0x380, 0x380, 0x384, 0x388, 0x400, 0x1600, 0x4194C, 0x41950, 0x4195C, 0x41960, 0x41E94, 0x41EA0, 0x81E94], ret = 4, regs = []}
++D3DDevice_SetVertexShaderConstant1 = {sec = "D3D", len = 0x5F, hash = "0x9E0CE9E5B849724D", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x41EA4], ret = 0, regs = ["ecx", "edx"]}
++D3DDevice_SetVertexShaderConstant1Fast = {}
++D3DDevice_SetVertexShaderConstant4 = {sec = "D3D", len = 0xA2, hash = "0xB4864F9B11A50016", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x4C, 0x41EA4], ret = 0, regs = ["ecx", "edx"]}
++D3DDevice_SetVertexShaderConstantNotInlineFast = {sec = "D3D", len = 0xD0, hash = "0x7FB80A656C3E3607", calls = [[0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]]], k = [0x40, 0x40, 0x44, 0x60, 0xB80, 0x41EA4], ret = 4, regs = ["ecx", "edx"]}
++D3DDevice_SetViewport = {sec = "D3D", len = 0x160, hash = "0xE92CD588CDB2EF12", calls = [[0x140, "0xC081BB8DEB5DCB72", [[0xFA, "0xFB0FEB1CD8F3F37D"]]], [0x197, "0x3FE0B249528CD165", [[0xF, "0x992EC001666B3982"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"]]], [0xF, "0x992EC001666B3982", [[0x173, "0xD1EB123489248CDA"]]], [0x1E5, "0x3A2E5DF5855DE0AB", [[0x125, "0xC4B1A5A400F19D91"]]]], k = [0x100, 0xA90, 0xA94, 0xA98, 0xA9C, 0xAA0, 0xAA4, 0xFFF, 0xFFF, 0xFFF, 0xFFF, 0x21B4, 0x21C0, 0x21C4], ret = 4, regs = []}
++D3DDevice_Swap = {sec = "D3D", len = 0xDB, hash = "0x640E0958B5533BFD", calls = [[0x8C, "0xED14D0E3799897A7", []], [0xAD, "0x65BC38CE726F47AC", [[0x173, "0xD1EB123489248CDA"], [0xE3, "0xEBBAF49BF9A48A6B"]]], [0x136, "0x2921BD57A8629C9E", [[0xAD, "0x65BC38CE726F47AC"], [0x111, "0x1451662D3E9BA2E3"], [0x61, "0x6B738B2D97B6E10E"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"]]], [0x1D7, "0x8FEA2B2EE81B73E", [[0x58, "0x943A7674248EFFC"], [0x54A, "0xD6CA4BE9BD7089C3"], [0x1A4, "0x90388D915345CE63"], [0x13F, "0x457686174D486666"], [0x119, "0xBDA843F4B620C6E2"], [0xF, "0x992EC001666B3982"], [0x18B, "0x5A44DA728F9307BD"], [0x17D, "0x1542B761DBEFD949"], [0x59, "0xA794D4A6137F8380"], [0xF, "0x992EC001666B3982"]]], [0xAD, "0x65BC38CE726F47AC", [[0x173, "0xD1EB123489248CDA"], [0xE3, "0xEBBAF49BF9A48A6B"]]], [0x136, "0x2921BD57A8629C9E", [[0xAD, "0x65BC38CE726F47AC"], [0x111, "0x1451662D3E9BA2E3"], [0x61, "0x6B738B2D97B6E10E"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"]]], [0x104, "0xF1B9769CA6832BCE", [[0xF, "0x992EC001666B3982"]]], [0x40, "0x6C445001DCAB4621", [[0xAD, "0x65BC38CE726F47AC"], [0x116, "0xC4CB2A1C820DA167"]]], [0x510, "0x2556F6D3EC126A59", [[0x14, "0x83E1D8D0BFEED376"], [0x34, "0xD5693061AEFA35A4"], [0xAA, "0x26810E04323EEB4A"], [0x43, "0x98CB0C3795F52E34"], [0x4D, "0x793EFFDBA3CC3CA7"], [0x5C, "0x23CABB00661424AB"], [0x5C, "0x23CABB00661424AB"], [0x4E, "0x1F36E2BD67978483"], [0x43, "0x23930C92013A3C5F"], [0xF4, "0xC803051E6BD52F1B"], [0x28, "0x1E9DB1E0296AC893"], [0x33, "0x957C5B5C51604B83"], [0xC8, "0xCD9420209525A177"], [0x84, "0xE57A19FF2A1427E"], [0xC8, "0xCD9420209525A177"], [0x6, "0x23A795BF0B32CC0E"], [0x12, "0x756CE65CF0761A6"], [0x33, "0x957C5B5C51604B83"], [0x33, "0x957C5B5C51604B83"], [0xE, "0x972EB562F739465D"], [0x37B, "0x8C598DF5355E5C4A"]]]], k = [0x40, 0x49C, 0x49C, 0x4A0, 0x4A0, 0x2124, 0x2124, 0x2C10, 0x2C10, 0x2C10, 0x2C10, 0x2C10], ret = 4, regs = []}
++D3DDevice_SwitchTexture = {}
++D3DResource_BlockUntilNotBusy = {}
++D3DResource_IsBusy = {}
++D3D_BlockOnNonSurfaceResource = {sec = "D3D", len = 0x36, hash = "0x8EAE61578A731A9B", calls = [[0x136, "0x2921BD57A8629C9E", [[0xAD, "0x65BC38CE726F47AC"], [0x111, "0x1451662D3E9BA2E3"], [0x61, "0x6B738B2D97B6E10E"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"]]], [0x136, "0x2921BD57A8629C9E", [[0xAD, "0x65BC38CE726F47AC"], [0x111, "0x1451662D3E9BA2E3"], [0x61, "0x6B738B2D97B6E10E"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"]]]], ret = 4, regs = []}
++D3D_BlockOnResource = {sec = "D3D", len = 0x78, hash = "0x99A9873B5DD90A04", calls = [[0x35, "0xCBE7179F091C68C3", []], [0x136, "0x2921BD57A8629C9E", [[0xAD, "0x65BC38CE726F47AC"], [0x111, "0x1451662D3E9BA2E3"], [0x61, "0x6B738B2D97B6E10E"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"]]], [0x35, "0xCBE7179F091C68C3", []], [0x136, "0x2921BD57A8629C9E", [[0xAD, "0x65BC38CE726F47AC"], [0x111, "0x1451662D3E9BA2E3"], [0x61, "0x6B738B2D97B6E10E"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"]]], [0x136, "0x2921BD57A8629C9E", [[0xAD, "0x65BC38CE726F47AC"], [0x111, "0x1451662D3E9BA2E3"], [0x61, "0x6B738B2D97B6E10E"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"]]]], k = [0x50000, 0x70000], ret = 4, regs = []}
++D3D_BlockOnTime = {sec = "D3D", len = 0x136, hash = "0x2921BD57A8629C9E", calls = [[0xAD, "0x65BC38CE726F47AC", [[0x173, "0xD1EB123489248CDA"], [0xE3, "0xEBBAF49BF9A48A6B"]]], [0x111, "0x1451662D3E9BA2E3", []], [0x61, "0x6B738B2D97B6E10E", []], [0x61, "0x6B738B2D97B6E10E", []], [0x2D, "0x217616639A7DDC94", []], [0x61, "0x6B738B2D97B6E10E", []], [0x2D, "0x217616639A7DDC94", []]], k = [0x2000, 0x2000, 0x21AC, 0x21AC, 0x21B0, 0x21B0, 0x2400, 0x2564, 0x2568, 0x40100, 0x40100, 0x40110, 0x80000000], ret = 8, regs = []}
++D3D_InitDefaultState = {sec = "D3D", len = 0xD2, hash = "0x480775A033A54161", calls = [[0x10E, "0xAEDF2475629B178A", [[0x140, "0xC081BB8DEB5DCB72"], [0xF1, "0x8BCA5E56FE192FCB"]]], [0x5D, "0xA914C7CD799F4C2E", [[0x27, "0xFD83B1F6F3776DB0"]]], [0x5D, "0xA914C7CD799F4C2E", [[0x27, "0xFD83B1F6F3776DB0"]]], [0xEC, "0x52377A3E3E06600C", [[0x105, "0x27A4472C813FF429"], [0x3D, "0xAD4A3146467D1DCD"], [0x39, "0xA293CC3B791733F7"], [0x63, "0x6E8A3692C91471EB"]]], [0xEC, "0x52377A3E3E06600C", [[0x105, "0x27A4472C813FF429"], [0x3D, "0xAD4A3146467D1DCD"], [0x39, "0xA293CC3B791733F7"], [0x63, "0x6E8A3692C91471EB"]]], [0x1A4, "0x90388D915345CE63", [[0x9C, "0x3E127CEF6093DFB6"], [0xF, "0x992EC001666B3982"], [0xF, "0x992EC001666B3982"]]], [0xEC, "0x52377A3E3E06600C", [[0x105, "0x27A4472C813FF429"], [0x3D, "0xAD4A3146467D1DCD"], [0x39, "0xA293CC3B791733F7"], [0x63, "0x6E8A3692C91471EB"]]], [0xEC, "0x52377A3E3E06600C", [[0x105, "0x27A4472C813FF429"], [0x3D, "0xAD4A3146467D1DCD"], [0x39, "0xA293CC3B791733F7"], [0x63, "0x6E8A3692C91471EB"]]], [0x49, "0x9FC9CCB594250450", [[0xF1, "0x8BCA5E56FE192FCB"], [0xF, "0x992EC001666B3982"], [0x1E5, "0x3A2E5DF5855DE0AB"]]]], k = [0x114, 0x118, 0x184, 0x1B4, 0x21CC], ret = 0, regs = []}
++D3D_InternalAddRef = {sec = "D3D", len = 0x32, hash = "0x79A41FE5E122B9C", k = [0x50000, 0x70000, 0x80000, 0x80000], ret = 4, regs = []}
++D3D_InternalRelease = {sec = "D3D", len = 0x62, hash = "0x39DF67CEF83C99D2", calls = [[0x9C, "0x3E127CEF6093DFB6", [[0x78, "0x99A9873B5DD90A04"], [0x46, "0x60BEFA9047E0FC04"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"]]], [0x9C, "0x3E127CEF6093DFB6", [[0x78, "0x99A9873B5DD90A04"], [0x46, "0x60BEFA9047E0FC04"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"]]]], k = [0xFFFF, 0x50000, 0x70000, 0x80000, 0xFFF80000, 0xFFF80000], ret = 4, regs = []}
++D3D_KickOffAndWaitForIdle = {sec = "D3D", len = 0x11, hash = "0xDB17E1C5AE9FF037", calls = [[0x136, "0x2921BD57A8629C9E", [[0xAD, "0x65BC38CE726F47AC"], [0x111, "0x1451662D3E9BA2E3"], [0x61, "0x6B738B2D97B6E10E"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"]]]], ret = 0, regs = []}
++D3D_MakeRequestedSpace = {sec = "D3D", len = 0x173, hash = "0xD1EB123489248CDA", calls = [[0x136, "0x2921BD57A8629C9E", [[0xAD, "0x65BC38CE726F47AC"], [0x111, "0x1451662D3E9BA2E3"], [0x61, "0x6B738B2D97B6E10E"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"], [0x61, "0x6B738B2D97B6E10E"], [0x2D, "0x217616639A7DDC94"]]], [0xE3, "0xEBBAF49BF9A48A6B", [[0x34, "0x97C6CFAEFCD6771C"]]], [0xAD, "0x65BC38CE726F47AC", [[0x173, "0xD1EB123489248CDA"], [0xE3, "0xEBBAF49BF9A48A6B"]]], [0xE3, "0xEBBAF49BF9A48A6B", [[0x34, "0x97C6CFAEFCD6771C"]]]], k = [0x44, 0x44, 0x44, 0x4C, 0x350, 0x354, 0x354, 0x4FC, 0x1000, 0x23BC, 0x324C, 0x4000, 0xFFFFFFF, 0x80000000, 0x80000000, 0xFFFFFDFC], ret = 8, regs = []}
++D3D_SetFence = {sec = "D3D", len = 0xAD, hash = "0x65BC38CE726F47AC", calls = [[0x173, "0xD1EB123489248CDA", [[0x136, "0x2921BD57A8629C9E"], [0xE3, "0xEBBAF49BF9A48A6B"], [0xAD, "0x65BC38CE726F47AC"], [0xE3, "0xEBBAF49BF9A48A6B"]]], [0xE3, "0xEBBAF49BF9A48A6B", [[0x34, "0x97C6CFAEFCD6771C"]]]], k = [0x40, 0x4C, 0x4C, 0x4C, 0x50, 0x58, 0x41D70, 0x41D90], ret = 4, regs = []}
++Direct3D_CreateDevice = {sec = "D3D", len = 0xA4, hash = "0x2EF8341A8AD1F083", calls = [[0x52E, "0x67159B355470C715", [[0xAD, "0xED9E56F88A16AC0B"], [0x162, "0xF678A5F83E9EF4CB"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0x63, "0xEC7AF7FB749DEE2D"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0xE3, "0xEBBAF49BF9A48A6B"], [0x1D, "0xB6FEF857C3841887"], [0xDE, "0x61D7C0791073CCE"], [0x560, "0x4EBC200F6415B297"], [0x5C, "0x23CABB00661424AB"], [0x23E, "0x412BDEB72961DF87"], [0x152, "0xE33C34218A33DCEC"], [0x17, "0xE2DB1972025BA6B2"], [0xD2, "0x480775A033A54161"], [0x39C, "0x3A6A120241FEB7ED"], [0x42, "0x4967F24AD9A579CC"], [0x51, "0xDB157F30148DAB9A"]]], [0x199, "0xD174DCBB61175C07", [[0x11, "0xDB17E1C5AE9FF037"], [0xE3, "0xEBBAF49BF9A48A6B"], [0x1D, "0xB6FEF857C3841887"], [0x11, "0xDF13E8CDCC5CA945"], [0x11D, "0xF03465579705A23D"], [0x20, "0xD27E8E64BE393620"], [0x9C, "0x3E127CEF6093DFB6"], [0x9C, "0x3E127CEF6093DFB6"], [0x9C, "0x3E127CEF6093DFB6"], [0x9C, "0x3E127CEF6093DFB6"], [0x1E, "0x25794508EBC6E332"], [0x1BC, "0xB482FC2CF138F1C4"]]]], k = [0xB0C, 0x8000, 0x80000], ret = 24, regs = []}
++DirectSoundCreate = {sec = "DSOUND", len = 0x47, hash = "0x3BBCDFE434237F24", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x6D, "0x54749E63BADEC62D", [[0x15, "0xA06C401FA8F9EA12"], [0x11, "0x2B6130851883E06E"], [0x1D, "0x936A8E6B64B4B1F7"], [0x129, "0xD90A48F56922F557"]]]], ret = 12, regs = []}
++DirectSoundCreateBuffer = {}
++DirectSoundCreateStream = {sec = "DSOUND", len = 0x57, hash = "0xC2431935FBC2C56E", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x6D, "0x54749E63BADEC62D", [[0x15, "0xA06C401FA8F9EA12"], [0x11, "0x2B6130851883E06E"], [0x1D, "0x936A8E6B64B4B1F7"], [0x129, "0xD90A48F56922F557"]]], [0x91, "0xA8084C901AC7275A", [[0x1E, "0x77CF69460E7107DD"], [0x11, "0x2B6130851883E06E"], [0x25, "0xA8574C55272D2AC1"], [0xAA, "0x3DBAE56B922C52DA"]]]], ret = 8, regs = []}
++DirectSoundDoWork = {sec = "DSOUND", len = 0x29, hash = "0x3F0CD1C7D0D542BB", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x31, "0x5A90CBA1AACC1ADD", [[0x1E, "0x77CF69460E7107DD"], [0x95, "0x34FAD8CBCE69A43C"]]]], ret = 0, regs = []}
++DirectSoundUseFullHRTF = {}
++DirectSoundUseLightHRTF = {}
++IDirectSoundBuffer_GetCurrentPosition = {sec = "DSOUND", len = 0x20, hash = "0x58625E847EC088E7", calls = [[0x55, "0xE60F054C4E847816", [[0x1E, "0x77CF69460E7107DD"], [0xD9, "0xE2655180A786E830"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_GetStatus = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x51, "0xBCCF9F0C46F7ABDF", [[0x1E, "0x77CF69460E7107DD"], [0x42, "0xAC82B5929C476085"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_Lock = {}
++IDirectSoundBuffer_Pause = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x51, "0xBCCF9F0C46F7ABDF", [[0x1E, "0x77CF69460E7107DD"], [0x73, "0x733CBB08CECD2D11"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_Play = {sec = "DSOUND", len = 0x24, hash = "0x16089413899A14CC", calls = [[0x51, "0x9C8E2BA2A67E258F", [[0x1E, "0x77CF69460E7107DD"], [0xB0, "0x1A397E11BA0E3CFC"]]]], ret = 16, regs = []}
++IDirectSoundBuffer_Release = {sec = "DSOUND", len = 0x16, hash = "0x4FA5AC4A92DAE1E3", ret = 4, regs = []}
++IDirectSoundBuffer_SetAllParameters = {}
++IDirectSoundBuffer_SetBufferData = {sec = "DSOUND", len = 0x20, hash = "0x58625E847EC088E7", calls = [[0xAE, "0x5A3DE3846E6F091E", [[0x1E, "0x77CF69460E7107DD"], [0x31, "0x47968FCBCDFCC2E8"], [0x8C, "0xA014E167D0F04C96"], [0x1A, "0x95F7B080E198CB9C"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_SetCurrentPosition = {}
++IDirectSoundBuffer_SetEG = {}
++IDirectSoundBuffer_SetFilter = {}
++IDirectSoundBuffer_SetFormat = {}
++IDirectSoundBuffer_SetFrequency = {}
++IDirectSoundBuffer_SetHeadroom = {}
++IDirectSoundBuffer_SetI3DL2Source = {}
++IDirectSoundBuffer_SetLoopRegion = {sec = "DSOUND", len = 0x20, hash = "0x58625E847EC088E7", calls = [[0x85, "0x1A27244AC3B17570", [[0x1E, "0x77CF69460E7107DD"], [0x1E, "0x55A9B42BDFAA965A"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_SetMaxDistance = {}
++IDirectSoundBuffer_SetMinDistance = {}
++IDirectSoundBuffer_SetMixBinVolumes = {}
++IDirectSoundBuffer_SetMixBins = {}
++IDirectSoundBuffer_SetOutputBuffer = {}
++IDirectSoundBuffer_SetPitch = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x19, "0xCEC36E92D765A281"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_SetPlayRegion = {}
++IDirectSoundBuffer_SetPosition = {}
++IDirectSoundBuffer_SetRolloffCurve = {}
++IDirectSoundBuffer_SetVelocity = {}
++IDirectSoundBuffer_SetVolume = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x1C, "0xFC6E09B4AD4AB568"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_Stop = {sec = "DSOUND", len = 0x18, hash = "0x6B88620E3F09B885", calls = [[0x4F, "0x8E32B086615BD924", [[0x1E, "0x77CF69460E7107DD"], [0x90, "0x404B1DB232FEDBB4"]]]], ret = 4, regs = []}
++IDirectSoundBuffer_StopEx = {sec = "DSOUND", len = 0x24, hash = "0x16089413899A14CC", calls = [[0x59, "0x3747B745B5CD70D5", [[0x1E, "0x77CF69460E7107DD"], [0x39, "0x7FC597D868C6CAE"]]]], ret = 16, regs = []}
++IDirectSoundBuffer_Unlock = {}
++IDirectSoundStream_SetEG = {}
++IDirectSound_CommitDeferredSettings = {}
++IDirectSound_CommitEffectData = {}
++IDirectSound_CreateSoundBuffer = {sec = "DSOUND", len = 0x24, hash = "0xBBF11F9B43DBC968", calls = [[0x9C, "0x71DC342A694E3431", [[0x1E, "0x77CF69460E7107DD"], [0x11, "0x2B6130851883E06E"], [0x18, "0x7267DDD0F33D17E1"], [0xE8, "0xB77613076CB92CE"]]]], ret = 16, regs = []}
++IDirectSound_CreateSoundStream = {sec = "DSOUND", len = 0x24, hash = "0xBBF11F9B43DBC968", calls = [[0x91, "0xA8084C901AC7275A", [[0x1E, "0x77CF69460E7107DD"], [0x11, "0x2B6130851883E06E"], [0x25, "0xA8574C55272D2AC1"], [0xAA, "0x3DBAE56B922C52DA"]]]], ret = 16, regs = []}
++IDirectSound_DownloadEffectsImage = {}
++IDirectSound_EnableHeadphones = {}
++IDirectSound_GetEffectData = {}
++IDirectSound_GetOutputLevels = {}
++IDirectSound_GetSpeakerConfig = {}
++IDirectSound_Release = {sec = "DSOUND", len = 0x16, hash = "0xF58E37D24D1C967F", ret = 4, regs = []}
++IDirectSound_SetDistanceFactor = {}
++IDirectSound_SetDopplerFactor = {}
++IDirectSound_SetEffectData = {}
++IDirectSound_SetI3DL2Listener = {}
++IDirectSound_SetMixBinHeadroom = {}
++IDirectSound_SetOrientation = {}
++IDirectSound_SetPosition = {}
++IDirectSound_SetRolloffFactor = {}
++IDirectSound_SetVelocity = {}
++IDirectSound_SynchPlayback = {sec = "DSOUND", len = 0x18, hash = "0x1170ED95F94B6D21", calls = [[0xF, "0x28DE41C83CE8C5F1", [[0x13F, "0xF85D1D672FD521DF"]]]], ret = 4, regs = []}
++Lock2DSurface = {sec = "D3D", len = 0x9B, hash = "0x2CFB04890FE9A81D", calls = [[0x78, "0x99A9873B5DD90A04", [[0x35, "0xCBE7179F091C68C3"], [0x136, "0x2921BD57A8629C9E"], [0x35, "0xCBE7179F091C68C3"], [0x136, "0x2921BD57A8629C9E"], [0x136, "0x2921BD57A8629C9E"]]], [0x233, "0x1884A5E508C42004", []]], k = [0x40, 0xF0000000], ret = 24, regs = []}
++WSACancelOverlappedIO = {}
++WSAGetLastError = {}
++WSAGetOverlappedResult = {}
++WSARecv = {}
++WSARecvFrom = {}
++WSASend = {}
++WSASendTo = {}
++WSAStartup = {}
++XAudioDownloadEffectsImage = {}
++XInitDevices = {sec = "XPP", len = 0x8E, hash = "0xD8B1D7BD45620CA2", calls = [[0x5A, "0xCE45BB07D2B70E78", []], [0x151, "0x393125B8C5ACB6CE", []], [0xC, "0xE51B784F4912F43", [[0x1C5, "0x45EA4087BCF19DE1"]]], [0x9F, "0x6FB855D7E47FC803", [[0x30, "0x476A4AB45D1F264A"]]], [0x42, "0x57440CC2F164E4C6", [[0x79, "0x8C815D284952FCDC"]]]], k = [0xA0, 0xA1, 0xA4], ret = 8, regs = []}
++XInputClose = {sec = "XPP", len = 0xC, hash = "0xE51B784F4912F43", calls = [[0x97, "0x921C8F5C4093BD53", [[0x1E, "0xFF194F8C1EBD8CA5"]]]], ret = 4, regs = []}
++XInputGetCapabilities = {}
++XInputGetState = {sec = "XPP", len = 0x6C, hash = "0x98446252EABD21A9", k = [0xA3, 0xA3, 0x48F], ret = 8, regs = []}
++XInputOpen = {sec = "XPP", len = 0x56, hash = "0xADCB23E069376F62", calls = [[0x2B, "0x3AFC17F845C76821", []], [0x2E, "0xA4B3020F0A3ABBE1", []], [0x23E, "0x58A15184E2B70B72", [[0x6A, "0xCC56D466B83A74CB"], [0xAB, "0x27AA026C805261A4"], [0xED, "0xFA42D5F71A831284"], [0x4D, "0xB20D520F33AD3B2F"], [0xED, "0xFA42D5F71A831284"], [0x6E, "0x396F322CFE0035A0"], [0x97, "0x921C8F5C4093BD53"]]], [0x2E, "0xA4B3020F0A3ABBE1", []]], ret = 16, regs = []}
++XInputSetState = {sec = "XPP", len = 0x33, hash = "0xA53050801CDCDD50", calls = [[0x12E, "0x8CC2092C9971EA6C", [[0xED, "0xFA42D5F71A831284"], [0x6E, "0x396F322CFE0035A0"]]]], k = [0x40, 0x41, 0xA3], ret = 8, regs = []}
++XLaunchNewImageA = {sec = ".text", len = 0x13D, hash = "0x7E3E1628B4F6DB6F", calls = [[0x65, "0x54CDB20F4AF9D53", [[0x3B, "0xDC2BA2A19B4CAAA0"], [0x11, "0xE9D4E501BB73B97B"]]], [0x47, "0xE2C71FA7B964262E", [[0xE1, "0xC9C936E44BC225AB"]]]], k = [0x40, 0x44, 0x5C, 0x64, 0x168, 0x208, 0xFFFFFC7C, 0xFFFFFC7C, 0xFFFFFE84, 0xFFFFFE84, 0xFFFFFE84, 0xFFFFFE84], ret = 8, regs = []}
++XMountUtilityDrive = {sec = ".text", len = 0x105, hash = "0xAE7D3CB029BED347", calls = [[0x22B, "0x56D39E8A39E2920", [[0x1EF, "0x5AD6522DCAFFC6A5"]]], [0x57, "0x35E738CB71CF6CCB", [[0x767, "0xEDA17BCF9B61B7DE"], [0x119, "0x9AF6541964E9CA55"]]], [0x316, "0xCDD993017D11F7E3", [[0x17, "0x5A64BF0410E06F62"], [0x4, "0x8D1AC00050A2EA5F"], [0xAA, "0x26810E04323EEB4A"], [0x2E, "0xA4B3020F0A3ABBE1"], [0x1D, "0x345B18AE6CE600A0"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"], [0x17, "0x5A64BF0410E06F62"]]], [0x78, "0x31DF218FE930CC6B", []], [0x316, "0xCDD993017D11F7E3", [[0x17, "0x5A64BF0410E06F62"], [0x4, "0x8D1AC00050A2EA5F"], [0xAA, "0x26810E04323EEB4A"], [0x2E, "0xA4B3020F0A3ABBE1"], [0x1D, "0x345B18AE6CE600A0"], [0x1E, "0x25794508EBC6E332"], [0x1E, "0x25794508EBC6E332"], [0x17, "0x5A64BF0410E06F62"]]], [0x78, "0x31DF218FE930CC6B", []], [0x17, "0x5A64BF0410E06F62", [[0x2E, "0xA4B3020F0A3ABBE1"]]]], k = [0x4000, 0xFFFFFEEC, 0xFFFFFEEC, 0xFFFFFEEC], ret = 4, regs = []}
++XNetCreateKey = {}
++XNetDnsLookup = {}
++XNetDnsRelease = {}
++XNetGetEthernetLinkStatus = {}
++XNetGetTitleXnAddr = {}
++XNetInAddrToXnAddr = {}
++XNetRandom = {}
++XNetRegisterKey = {}
++XNetStartup = {}
++XNetUnregisterKey = {}
++XNetXnAddrToInAddr = {}
++XOnlineCleanup = {}
++XOnlineStartup = {}
++_CIacos = {sec = ".text", len = 0x14, hash = "0x242CEA3CB8F35082", calls = [[0x16, "0xC97C95373548D0C1", []], [0xAE, "0xECA88B2666FCEC33", [[0x17, "0xF81CE75911DCA1F"], [0xD, "0x2C9670118DBFA776"], [0x2A, "0xFF8C47D71A6F8F0B"], [0x19, "0xE0ABAB34218B76AB"], [0xD, "0x2C9670118DBFA776"], [0x3C, "0x274B0770BF01B42F"]]]], ret = 0, regs = []}
++_CIasin = {}
++accept = {}
++bind = {}
++closesocket = {}
++connect = {}
++crt_acos = {sec = ".text", len = 0xAE, hash = "0xECA88B2666FCEC33", calls = [[0x17, "0xF81CE75911DCA1F", []], [0xD, "0x2C9670118DBFA776", []], [0x2A, "0xFF8C47D71A6F8F0B", [[0x3C, "0x274B0770BF01B42F"]]], [0x19, "0xE0ABAB34218B76AB", []], [0xD, "0x2C9670118DBFA776", []], [0x3C, "0x274B0770BF01B42F", [[0xDD, "0xDC0DDB108AE82296"]]]], k = [0x3FF00000, 0x80000000], ret = 0, regs = ["eax"]}
++crt_asin = {}
++crt_atan = {}
++crt_cos = {}
++crt_log = {}
++crt_log10 = {}
++crt_pow = {}
++crt_sin = {}
++crt_sqrt = {}
++crt_tan = {}
++getsockname = {}
++getsockopt = {}
++ioctlsocket = {}
++listen = {}
++recv = {}
++recvfrom = {}
++select = {}
++send = {}
++sendto = {}
++setsockopt = {}
++shutdown = {}
++socket = {}
++
++[anchors]
++DSound_StreamVtable_ref = {sec = "DSOUND", len = 0x41, hash = "0xAE8A5E045B571806", calls = [[0x4D, "0xD9D42FA7031A2CB1", [[0x1F, "0xD1EBB22741D550CD"]]]]}
++XPP_GamepadType_ref = {sec = "XPP", len = 0x37, hash = "0x764B1E34B04F7173"}
++
++[data]
++D3D_DeferredTextureState = {in = "D3DDevice_SetTextureStageStateNotInline", insn = 13, op = "disp"}
++D3D_Device = {in = "D3DDevice_SetRenderState_Simple", insn = 0, op = "disp"}
++D3D_DirtyFlags = {in = "D3DDevice_SelectVertexShader", insn = 9, op = "disp"}
++D3D_FvfShader = {in = "D3DDevice_SetVertexShader", insn = 16, op = "imm"}
++D3D_IndexData = {in = "D3DDevice_SetIndices", insn = 8, op = "disp"}
++D3D_RenderState = {in = "D3DDevice_SetPixelShader", insn = 63, op = "imm"}
++D3D_SimpleRenderStateEncode = {in = "D3DDevice_SetRenderStateNotInline", insn = 4, op = "disp"}
++D3D_Streams = {in = "D3DDevice_SetStreamSource", insn = 24, op = "disp"}
++D3D_pDevice = {in = "CDevice_KickOff", insn = 12, op = "disp"}
++DSound_StreamVtable = {in = "DSound_StreamVtable_ref", insn = 4, op = "imm"}
++DSound_StreamVtable2 = {in = "DSound_StreamVtable_ref", insn = 5, op = "imm"}
++XPP_GamepadType = {in = "XPP_GamepadType_ref", insn = 3, op = "imm", deref = [0x0, 0x4]}
++XPP_MemoryUnitType = {}
+diff --git a/xdk/5659/layout.toml b/xdk/5659/layout.toml
+new file mode 100644
+index 0000000..8aa39fa
+--- /dev/null
++++ b/xdk/5659/layout.toml
+@@ -0,0 +1,53 @@
++# XDK 5659 library data layouts the runtime reads or writes. Each value was read from the 5659 library code of
++# Crimson Skies: High Road to Revenge (default.xbe, title 0x4D530021); the address is the function in that image.
++# Most offsets sit 0x10 lower than 5849 from the pixel shader field on: 5659's CDevice is 0x10 smaller.
++[layout]
++# D3D8 CDevice, the static device D3D__pDevice points at
++CDevice_Push          = 0x0     # D3DDevice_SetTexture 0x2034B0 reads it, compares with +4, calls MakeSpace
++CDevice_PushThreshold = 0x4     # D3DDevice_SetTexture 0x2034B0 compares the push pointer with it
++CDevice_BaseVertex    = 0x1C    # D3DDevice_SetIndices 0x2036F0 stores BaseVertexIndex
++CDevice_IndexBuffer   = 0x79C   # D3DDevice_SetIndices 0x2036F0 reads the old one and stores the new one
++CDevice_ZScale        = 0x944   # D3DDevice_GetViewportOffsetAndScale 0x200110 scales the Z range by it
++CDevice_SuperSampleX  = 0x958   # D3DDevice_GetViewportOffsetAndScale 0x200110 scales viewport X by it
++CDevice_SuperSampleY  = 0x95C   # D3DDevice_GetViewportOffsetAndScale 0x200110 scales viewport Y by it
++CDevice_Transforms    = 0xC50   # D3DDevice_SetTransform 0x2027C0 copies 16 dwords to +0xC50 + type * 64
++CDevice_Textures      = 0xF78   # D3DDevice_SetTexture 0x2034B0 reads and stores [stage]
++CDevice_Palettes      = 0xF88   # D3DDevice_SetPalette 0x203660 stores [stage]
++CDevice_RenderTarget  = 0x19F4  # D3DDevice_GetRenderTarget2 0x203240 returns it, D3DDevice_SetViewport 0x203280 reads it
++CDevice_Depth         = 0x19F8  # D3DDevice_GetDepthStencilSurface2 0x203260 returns it
++CDevice_BackBuffer    = 0x1A04  # D3DDevice_GetBackBuffer2 0x202EC0 returns [0x1A04 + n * 4] for index 0; InitializeFrameBuffers 0x209980 fills the table
++CDevice_FrontBuffer   = 0x1A08  # D3DDevice_GetBackBuffer2 0x202EC0 returns it for index -1
++CDevice_SwapCount     = 0x2468  # D3DDevice_Swap 0x2061F0 increments it and returns it
++CDevice_Size          = 0x2490  # Direct3D_CreateDevice 0x2066B0 clears 0x924 dwords of the device on failure
++CDevice_Flags             = 0x8    # Direct3D_CreateDevice 0x2066B0 ors BehaviorFlags & 0x10 into it, D3DDevice_SetPixelShader 0x204540 tests that bit
++CDevice_Time              = 0x2C   # same field as 5849: the fence time the push buffer waits on
++CDevice_PixelShader       = 0x780  # D3DDevice_SetPixelShader 0x204540 stores the handle at the top
++CDevice_VertexShader      = 0x790  # D3DDevice_SetVertexShader 0x202590 reads and stores the current shader object here, the handle goes to 0x794; the native code at 0x2024A0 dereferences it
++CDevice_BackBufferScale   = 0x968  # CDevice::InitializeFrameBuffers 0x209980 stores the X scale as a float, the Y scale at +4
++CDevice_Viewport          = 0xED0  # D3DDevice_SetViewport 0x203280 stores X, Y, Width, Height, MinZ (+0x10), MaxZ
++CDevice_ScreenSpaceOffset = 0xEE8  # D3DDevice_SetScreenSpaceOffset 0x203E40 stores x + 0.53125, y + 0.53125 at +4
++CDevice_AutoDepth         = 0x1A10 # CDevice::InitializeFrameBuffers 0x209980 stores the depth buffer it makes
++CDevice_VBlankCallback    = 0x1DA8 # CMiniport::VBlank 0x20AB10 calls [miniport + 0x190], the miniport is at +0x1C18 (D3DDevice_SetGammaRamp 0x202730)
++CDevice_VBlankEvent       = 0x1DAC # D3DDevice_BlockUntilVerticalBlank 0x202990 waits on it, clears its SignalState at +4; CMiniport::VBlank sets miniport + 0x194
++CDevice_DisplayFlags      = 0x1DCC # D3D_GetAdapterDisplayMode reads [dev + 0x1DCC], the mode entry at miniport + 0x1B4
++CDevice_VBlankCount       = 0x1DD8 # CMiniport::VBlank 0x20AB10 increments miniport + 0x1C0
++CDevice_Field             = 0x1DE8 # CMiniport::VBlank 0x20AB10 stores the field at miniport + 0x1D0
++CDevice_GammaRamps        = 0x1DF4 # D3DDevice_SetGammaRamp 0x202730 copies to miniport + 0x1DC + index * 0x300
++CDevice_GammaPending      = 0x23F4 # D3DDevice_SetGammaRamp 0x202730 sets [miniport + 0x7DC + index * 4]
++# D3D8 globals
++DirtyFlags_Texture    = 0x4800  # D3DDevice_SetTexture 0x2034B0 ors it into D3D__DirtyFlags
++TextureState_Stage    = 32      # D3DDevice_SetTextureStageStateNotInline 0x200AF0: [stage * 32 + type] dwords
++Stream_Size           = 12      # D3DDevice_SetStreamSource 0x202190 indexes the stream table by n * 12
++Stream_Stride         = 0x0     # D3DDevice_SetStreamSource 0x202190 stores Stride
++Stream_Buffer         = 0x8     # D3DDevice_SetStreamSource 0x202190 stores the vertex buffer
++PixelShader_Definition = 0x8  # D3DDevice_SetPixelShader 0x204540 reads the definition pointer at handle + 8
++# DSOUND
++CDirectSoundStream_Vtable  = 0x0  # CDirectSoundStream constructor 0x239104 stores the IDirectSoundStream vtable at +0
++CDirectSoundStream_Vtable2 = 0x4  # CDirectSoundStream constructor 0x239104 stores the CDirectSoundVoice vtable at +4
++EffectsImage_Skip0    = 0x804   # CMcpxGPDspManager::ParseEffectImageInfo 0x23ABBD adds this dword count
++EffectsImage_Skip1    = 0x80C   # CMcpxGPDspManager::ParseEffectImageInfo 0x23ABBD loads this dword count
++EffectsImage_Desc     = 0x818   # ParseEffectImageInfo 0x23ABBD: descriptor at image + 0x818 + (Skip0 + Skip1) * 4
++# XAPI XPP device type record
++XPP_Current           = 0x0     # XGetDevices returns it
++XPP_Changed           = 0x4     # XGetDevices clears it, XGetDeviceChanges 0x286987 tests it
++XPP_Previous          = 0x8     # XGetDevices copies Current into it
+diff --git a/xdk/5659/signatures.toml b/xdk/5659/signatures.toml
+new file mode 100644
+index 0000000..04c5052
+--- /dev/null
++++ b/xdk/5659/signatures.toml
+@@ -0,0 +1,282 @@
++# XDK library signatures read by xbe_symbols, written by xbe_symbols in sign mode. No library bytes stored.
++# [symbols] name = {sec, len, hash, calls, deep, count, nth}: hash of len bytes from the function start in
++# section sec, image addresses and rel32 targets masked; calls = [len, hash, calls] of each rel32 call or
++# jump target outside it, in order, two levels deep; deep = lookalikes exist, so the callees' callees must
++# match too; count and nth pick one of identical functions by link order; xtlid = its .XTLID export id,
++# used when the bytes match nothing. {} = no signature, stays 0.
++# k = its constants, sorted: immediates and displacements of instructions that do not use the stack, when
++# not an image address, a branch target or below 0x40; an address inside .text counts in a library section,
++# which holds no such pointer. ret = stack bytes its rets pop, regs = registers it reads before it writes
++# them. A function the bytes do not find is matched by k; ret and regs then show a changed convention.
++# [anchors] functions only used to find data. [data] in = function, insn = instruction index, op = operand,
++# deref = offsets of the dwords then read in turn, for data behind a table, xtlid = the id .XTLID lists the
++# address under, used when in finds nothing.
++
++[symbols]
++BinkDoFrame = {}
++BinkGetSummary = {}
++BinkNextFrame = {}
++BinkWait = {}
++CDevice_KickOff = {sec = "D3D", len = 0xB0, hash = "0xC9801DB361BC6F1", calls = [[0x2F, "0x57A04D95FBC2B960", []]], k = [0x40, 0x40, 0x40, 0x44, 0x76C, 0x1C10, 0x1C10, 0x1C10, 0x1C18, 0x1DD4, 0x2000, 0x2468, 0x100410, 0x100410, 0x100410, 0xFFFFFFF, 0xFFFFFFF], ret = 0, regs = ["ecx"]}
++CDirectSoundStream_AddRef = {sec = "DSOUND", len = 0x47, hash = "0x38BA55285D0DEB0F", calls = [[0x1E, "0x77CF69460E7107DD", []]], k = [0x80004005], ret = 4, regs = []}
++CDirectSoundStream_Discontinuity = {sec = "DSOUND", len = 0x4D, hash = "0x9DAC564EADCFB54", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x2D, "0x1E71247CF93B945B", [[0x18, "0x834CCFBA1ED65DE1"], [0x4, "0x7C528B01F97475C1"], [0x72, "0x320CB9AFE83584AB"]]]], k = [0x80004005], ret = 4, regs = []}
++CDirectSoundStream_Flush = {sec = "DSOUND", len = 0x4B, hash = "0x59C65FA25B526490", calls = [[0x1E, "0x77CF69460E7107DD", []], [0xE0, "0x692DA26ED72ADDB6", [[0x22, "0xA95445FEF3BBFC1C"], [0xC3, "0xB5A2BA37A35D4669"], [0x13A, "0x25CA87318ABE4FA7"], [0x17, "0x7E2C3744D63891F6"], [0x1C, "0xB47831EEA01CBE7B"], [0x76, "0x5BB55BA34D1E6DA2"], [0x40, "0x98C9E7FDE97CC576"], [0x28, "0xA2796D5D848B3EC8"]]]], k = [0x80004005], ret = 4, regs = []}
++CDirectSoundStream_FlushEx = {sec = "DSOUND", len = 0x6A, hash = "0x2BF3F65042B4E7DE", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x39, "0xA29AFE6C7C341632", [[0x72, "0x320CB9AFE83584AB"]]], [0xE0, "0x692DA26ED72ADDB6", [[0x22, "0xA95445FEF3BBFC1C"], [0xC3, "0xB5A2BA37A35D4669"], [0x13A, "0x25CA87318ABE4FA7"], [0x17, "0x7E2C3744D63891F6"], [0x1C, "0xB47831EEA01CBE7B"], [0x76, "0x5BB55BA34D1E6DA2"], [0x40, "0x98C9E7FDE97CC576"], [0x28, "0xA2796D5D848B3EC8"]]]], k = [0x80004005], ret = 16, regs = []}
++CDirectSoundStream_GetInfo = {sec = "DSOUND", len = 0x67, hash = "0x1E4E16EF303ED7B2", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x3F, "0x5A0B4B1C2B57BCF6", []]], k = [0x80004005], ret = 8, regs = []}
++CDirectSoundStream_GetStatus = {sec = "DSOUND", len = 0x51, hash = "0xD83AF4801D8A8A83", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x5A, "0xBDA007CC3F61348F", []]], k = [0x80004005], ret = 8, regs = []}
++CDirectSoundStream_Pause = {}
++CDirectSoundStream_Process = {sec = "DSOUND", len = 0x77, hash = "0xAD7969B067281366", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x5A, "0xBDA007CC3F61348F", []], [0xCE, "0x17E3C1F05713A28C", [[0x1E, "0x42AB97AE89C70500"], [0x4, "0x7CA41B01F9B9C199"], [0x17A, "0xA790E667CE904B9B"], [0x22, "0xA95445FEF3BBFC1C"], [0x1F, "0xD1EBB22741D550CD"], [0x17, "0x7E2C3744D63891F6"], [0x22, "0xA95445FEF3BBFC1C"], [0x17, "0x7E2C3744D63891F6"], [0xE4, "0xC022F3F3C1AC8307"]]]], k = [0x80004005, 0x88780032], ret = 12, regs = []}
++CDirectSoundStream_Release = {sec = "DSOUND", len = 0x4E, hash = "0xB7724C9F86CABB4A", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x21, "0x545367C7F2AFA0FD", []]], k = [0x80004005], ret = 4, regs = []}
++CDirectSoundStream_SetFilter = {}
++CDirectSoundStream_SetFormat = {}
++CDirectSoundStream_SetFrequency = {}
++CDirectSoundStream_SetHeadroom = {sec = "DSOUND", len = 0x52, hash = "0xD67AF17BD694BB31", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x23, "0x7AD49519FCD1508B", [[0x98, "0xFC9BB13430B7D587"]]]], k = [0x80004005], ret = 8, regs = []}
++CDirectSoundStream_SetI3DL2Source = {}
++CDirectSoundStream_SetMaxDistance = {}
++CDirectSoundStream_SetMinDistance = {}
++CDirectSoundStream_SetMixBinVolumes = {sec = "DSOUND", len = 0x52, hash = "0xD67AF17BD694BB31", deep = true, calls = [[0x1E, "0x77CF69460E7107DD", []], [0x1D, "0x47CDFFB8109088B7", [[0x25, "0x9838AE401F2848ED"], [0x98, "0xFC9BB13430B7D587"]]]], k = [0x80004005], ret = 8, regs = []}
++CDirectSoundStream_SetMixBins = {sec = "DSOUND", len = 0x52, hash = "0xD67AF17BD694BB31", deep = true, calls = [[0x1E, "0x77CF69460E7107DD", []], [0x1D, "0x47CDFFB8109088B7", [[0xCB, "0x1D2AE42273B5A551"], [0xC1, "0x7121B82983FAA57A"]]]], k = [0x80004005], ret = 8, regs = []}
++CDirectSoundStream_SetPosition = {}
++CDirectSoundStream_SetVelocity = {}
++CDirectSoundStream_SetVolume = {}
++D3DDevice_Begin = {sec = "D3D", len = 0x35, hash = "0xC578D9AD869E942C", calls = [[0x7E, "0xDE3584E8275D5E39", [[0x165, "0x793BD0B08424B910"], [0xBE, "0xE93F91BE58171ED6"], [0x37C, "0xBB8C913076EFD880"], [0x1E5, "0xAD0E034EBFA601BA"], [0x1DC, "0x2B63288784418244"], [0x380, "0x9EDFBF6D1C02B243"], [0x34E, "0x2B3646E7A9C1E7BA"], [0x1F3, "0x745CD8DCA7786D6D"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x800, 0x417FC], ret = 4, regs = []}
++D3DDevice_BeginPush = {sec = "D3D", len = 0x1B, hash = "0xFCA0A491132966EC", calls = [[0x191, "0x3C8EEC3BDDAF8655", [[0x7E, "0xDE3584E8275D5E39"], [0xF, "0x992EC001666B3982"]]], [0x44, "0xE8F129F67AA5166E", [[0x136, "0xD793887F7358EC80"]]]], regs = []}
++D3DDevice_BlockOnFence = {}
++D3DDevice_BlockUntilVerticalBlank = {sec = "D3D", len = 0x24, hash = "0xD0AF5DDC2219AD35", k = [0x1DAC, 0x1DB0], ret = 0, regs = []}
++D3DDevice_Clear = {sec = "D3D", len = 0x39F, hash = "0x54A8713B4314A86", calls = [[0x16, "0x1DBD5577E019815D", []], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x100, 0x958, 0x958, 0x95C, 0x95C, 0xED0, 0xED4, 0xED8, 0xEDC, 0x19F4, 0x19F8, 0x40208, 0x40208, 0x81D98, 0xC1D8C, 0xFFFFFDFF], ret = 24, regs = []}
++D3DDevice_CopyRects = {sec = "D3D", len = 0x323, hash = "0x2C8A52E9241557AE", calls = [[0x65, "0xC1AD19302E02169A", []], [0x65, "0xC1AD19302E02169A", []], [0x1A, "0xB3E4D9138AD9B318", []], [0x79, "0x8A7008697D80ABA6", [[0x1A, "0xB3E4D9138AD9B318"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0xFFF, 0xFFF, 0x1000, 0x191C, 0x1FC0, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x86300, 0x86308, 0xC4300], ret = 20, regs = []}
++D3DDevice_CreatePixelShader = {sec = "D3D", len = 0x48, hash = "0xD43AB1D1E974739", calls = [[0xA0, "0x5A415716A87528E0", [[0x2D, "0x672A57EE43D616DF"], [0x43, "0x23930C92013A3C5F"], [0x1D, "0x345B18AE6CE600A0"]]]], k = [0x8007000E], ret = 8, regs = []}
++D3DDevice_CreateVertexShader = {sec = "D3D", len = 0x13E, hash = "0x94093081E0C2E6AA", calls = [[0xF7, "0xD1E6B62F3D388EE7", []], [0xA0, "0x5A415716A87528E0", [[0x2D, "0x672A57EE43D616DF"], [0x43, "0x23930C92013A3C5F"], [0x1D, "0x345B18AE6CE600A0"]]], [0x199, "0xEAFF2E1A5A27F36F", []], [0x68, "0x48B54173CEF6CCA6", []], [0xF7, "0xD1E6B62F3D388EE7", []]], k = [0x46, 0x7F, 0x114, 0x114, 0x114, 0x118, 0x2078, 0x7378, 0x8007000E], ret = 16, regs = []}
++D3DDevice_DeletePixelShader = {sec = "D3D", len = 0x1D, hash = "0x8C8E2ECA2E278752", calls = [[0x1A, "0x4912EEE9E91F1F15", [[0x6, "0x23A795BF0B32CC0E"], [0x1E, "0x25794508EBC6E332"]]]], ret = 4, regs = []}
++D3DDevice_DeleteVertexShader = {sec = "D3D", len = 0x1B, hash = "0x8F035A79AED4E616", calls = [[0x1A, "0x4912EEE9E91F1F15", [[0x6, "0x23A795BF0B32CC0E"], [0x1E, "0x25794508EBC6E332"]]]], ret = 4, regs = []}
++D3DDevice_DrawIndexedVertices = {sec = "D3D", len = 0x257, hash = "0xD2903132F5C5AE29", calls = [[0x191, "0x3C8EEC3BDDAF8655", [[0x7E, "0xDE3584E8275D5E39"], [0xF, "0x992EC001666B3982"]]], [0x44, "0xE8F129F67AA5166E", [[0x136, "0xD793887F7358EC80"]]], [0x44, "0xE8F129F67AA5166E", [[0x136, "0xD793887F7358EC80"]]], [0xAB, "0xCC21394CADEBA5EF", [[0xF, "0x992EC001666B3982"], [0xB0, "0xC9801DB361BC6F1"]]]], k = [0x40, 0x40, 0x40, 0x40, 0x5C, 0x60, 0x1FF, 0x1FF, 0x3FE, 0x3FE, 0x800, 0x417FC, 0x417FC, 0x41808, 0x40001800, 0x40001800, 0x40001800, 0xFFFFE7FF], ret = 12, regs = []}
++D3DDevice_DrawIndexedVerticesUP = {sec = "D3D", len = 0x137, hash = "0x7665B677A9DF821F", calls = [[0x13E, "0x5932810106351DE1", [[0x7E, "0xDE3584E8275D5E39"], [0xF, "0x992EC001666B3982"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x44, "0xE8F129F67AA5166E", [[0x136, "0xD793887F7358EC80"]]], [0xAB, "0xCC21394CADEBA5EF", [[0xF, "0x992EC001666B3982"], [0xB0, "0xC9801DB361BC6F1"]]]], k = [0x7FF, 0x800, 0xBB8, 0xBB8, 0xBBC, 0xBC4, 0xC44, 0x417FC, 0x417FC, 0x40001818, 0xFFFFE7FF], ret = 20, regs = []}
++D3DDevice_DrawVertices = {}
++D3DDevice_DrawVerticesUP = {sec = "D3D", len = 0x165, hash = "0x6C5E0B5085060976", calls = [[0x13E, "0x5932810106351DE1", [[0x7E, "0xDE3584E8275D5E39"], [0xF, "0x992EC001666B3982"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x44, "0xE8F129F67AA5166E", [[0x136, "0xD793887F7358EC80"]]], [0x90, "0x233EA7E2170F4E7B", []], [0xAB, "0xCC21394CADEBA5EF", [[0xF, "0x992EC001666B3982"], [0xB0, "0xC9801DB361BC6F1"]]]], k = [0x80, 0x7FF, 0x800, 0xBB8, 0xBB8, 0xBBC, 0xBC0, 0xBC4, 0xC44, 0x417FC, 0x417FC, 0x40001818, 0xFFFFE7FF], ret = 16, regs = []}
++D3DDevice_EnableOverlay = {}
++D3DDevice_End = {sec = "D3D", len = 0x41, hash = "0x9B5818B5D04AA66", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0xAB, "0xCC21394CADEBA5EF", [[0xF, "0x992EC001666B3982"], [0xB0, "0xC9801DB361BC6F1"]]]], k = [0x417FC, 0xFFFFE7FF], ret = 0, regs = []}
++D3DDevice_EndPush = {sec = "D3D", len = 0xF, hash = "0x37C661E81F0F27D0", ret = 4, regs = []}
++D3DDevice_FlushVertexCache = {}
++D3DDevice_GetBackBuffer2 = {sec = "D3D", len = 0x43, hash = "0x23E4CC19296786D0", calls = [[0x37, "0x4DD4FEAA2A7C506E", []], [0x37, "0x4DD4FEAA2A7C506E", []]], k = [0x1A04, 0x1A04], ret = 4, regs = []}
++D3DDevice_GetDepthStencilSurface2 = {sec = "D3D", len = 0x1E, hash = "0x5C304AA58A5D3973", calls = [[0x37, "0x4DD4FEAA2A7C506E", []]], k = [0x19F8], ret = 0, regs = []}
++D3DDevice_GetRenderTarget2 = {sec = "D3D", len = 0x1A, hash = "0x63E3510E091DCB78", calls = [[0x37, "0x4DD4FEAA2A7C506E", []]], k = [0x19F4], ret = 0, regs = []}
++D3DDevice_GetTile = {}
++D3DDevice_GetVertexShaderFunction = {}
++D3DDevice_InsertFence = {}
++D3DDevice_IsFencePending = {}
++D3DDevice_LightEnable = {}
++D3DDevice_LoadVertexShader = {sec = "D3D", len = 0x54, hash = "0xB8308BF8A033EFAE", calls = [[0xAE, "0xA78B15FFEFF2AD11", []], [0x44, "0xE8F129F67AA5166E", [[0x136, "0xD793887F7358EC80"]]]], k = [0x114, 0x41E9C], ret = 8, regs = []}
++D3DDevice_LoadVertexShaderProgram = {}
++D3DDevice_MakeSpace = {sec = "D3D", len = 0xF, hash = "0x992EC001666B3982", calls = [[0x136, "0xD793887F7358EC80", [[0x49, "0x92FE8F574A61F335"], [0x16A, "0xD827AF39CDE2463"], [0xB0, "0xC9801DB361BC6F1"], [0xAB, "0xCC21394CADEBA5EF"], [0xB0, "0xC9801DB361BC6F1"]]]], ret = 0, regs = []}
++D3DDevice_PersistDisplay = {sec = "D3D", len = 0x12E, hash = "0xB3AFBC79CE9E93F4", calls = [[0x11, "0xDF13E8CDCC5CA945", []], [0x78, "0x554F5C16B45161D0", [[0x1F5, "0xE0B8D65E63C56FB2"]]], [0x323, "0x2C8A52E9241557AE", [[0x65, "0xC1AD19302E02169A"], [0x65, "0xC1AD19302E02169A"], [0x1A, "0xB3E4D9138AD9B318"], [0x79, "0x8A7008697D80ABA6"], [0xF, "0x992EC001666B3982"], [0xF, "0x992EC001666B3982"]]], [0x11, "0x8D6E8C4F5C3417EB", [[0x16A, "0xD827AF39CDE2463"]]], [0x65, "0xC1AD19302E02169A", []], [0x62, "0x2E6893DD1C3A86FA", []], [0x47, "0x59993DF9529382A4", []]], k = [0x934, 0xFFF, 0xFFF, 0x1A08, 0x1C18, 0x1C20, 0x80004005, 0x80004005], ret = 0, regs = []}
++D3DDevice_Release = {}
++D3DDevice_SelectVertexShader = {sec = "D3D", len = 0x9C, hash = "0xE249CDCCC3C59055", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x1E5, "0x41FF7FD0C959BC75", [[0x122, "0xA656385547294F40"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x70, 0x790, 0x790, 0x794, 0x798, 0x1000, 0x41EA0, 0x81E94], ret = 8, regs = []}
++D3DDevice_SetFlickerFilter = {sec = "D3D", len = 0x42, hash = "0xEAC8B3B49C7737F5", k = [0x1C18], ret = 4, regs = []}
++D3DDevice_SetGammaRamp = {sec = "D3D", len = 0x83, hash = "0xBE13BC64F389D174", calls = [[0x59, "0x8346A1C371490F0A", []]], k = [0xC0, 0xC0, 0x1DC, 0x1DC, 0x7DC, 0x7E4, 0x1C18, 0x23FC, 0x2468], ret = 8, regs = []}
++D3DDevice_SetIndices = {sec = "D3D", len = 0x84, hash = "0x81BD3EA895C17B0A", calls = [[0x91, "0x2B608654E08CF536", [[0x78, "0x435EB75785E123C"], [0x4B, "0xDB57BC295008F50C"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"]]]], k = [0x79C, 0x79C, 0x79C, 0x79C, 0x80000, 0xFFF80000], ret = 8, regs = []}
++D3DDevice_SetLight = {}
++D3DDevice_SetMaterial = {}
++D3DDevice_SetPalette = {sec = "D3D", len = 0x8D, hash = "0x5A1AEAE319C196A3", calls = [[0x91, "0x2B608654E08CF536", [[0x78, "0x435EB75785E123C"], [0x4B, "0xDB57BC295008F50C"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0xF88, 0xF88, 0xF88, 0x41B20, 0x80000, 0xFFF80000], ret = 8, regs = []}
++D3DDevice_SetPixelShader = {sec = "D3D", len = 0x1F3, hash = "0x288B70E48EF1C35F", calls = [[0x51, "0x113C472742A66A98", [[0xF, "0x992EC001666B3982"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x6A, "0xF1D5500953A982B7", []], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x6A, "0xF1D5500953A982B7", []]], k = [0xA8, 0xA8, 0xAC, 0xAC, 0xB0, 0xB0, 0xB4, 0xB4, 0xB8, 0xBC, 0xC0, 0xD8, 0xD8, 0xDC, 0xE0, 0xE4, 0xE8, 0xEC, 0xEC, 0xF0, 0xF0, 0xF4, 0xF8, 0xFC, 0x100, 0x780, 0x780, 0x784, 0x784, 0x784, 0x784, 0x788, 0x78C, 0x2000, 0x2000, 0x4000, 0x4800, 0x417F8, 0x41E78, 0x80288, 0x81E20, 0x81E74], ret = 4, regs = []}
++D3DDevice_SetPixelShaderConstant = {sec = "D3D", len = 0x2C7, hash = "0xFF5F13E3DD2C97E", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0xE4, 0xE8, 0xEC, 0x780, 0x8E0, 0x40A60, 0x40A64, 0x40A68, 0x40A6C, 0x40A70, 0x40A74, 0x40A78, 0x40A7C, 0x40A80, 0x40A84, 0x40A88, 0x40A8C, 0x40A90, 0x40A94, 0x40A98, 0x40A9C, 0x41E20, 0x41E24, 0xC181C, 0xF0000, 0xF0000, 0xF000000, 0xF000000, 0xF0000000, 0xF0000000], ret = 12, regs = []}
++D3DDevice_SetRenderStateNotInline = {sec = "D3D", len = 0x5D, hash = "0xA914C7CD799F4C2E", calls = [[0x27, "0xFD83B1F6F3776DB0", [[0xF, "0x992EC001666B3982"]]]], k = [0x5C, 0x88], ret = 8, regs = []}
++D3DDevice_SetRenderState_BackFillMode = {sec = "D3D", len = 0x51, hash = "0xBC78C06F8285CC04", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x8038C], ret = 4, regs = []}
++D3DDevice_SetRenderState_CullMode = {sec = "D3D", len = 0x68, hash = "0x41E41F4067D70FAB", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x404, 0x40308, 0x4039C], ret = 4, regs = []}
++D3DDevice_SetRenderState_DoNotCullUncompressed = {sec = "D3D", len = 0x11, hash = "0x4F7F4A773101B2F1", count = 3, nth = 2, deep = true, calls = [[0xCE, "0x1D8C3FA32843A29F", [[0xF, "0x992EC001666B3982"]]]], ret = 4, regs = []}
++D3DDevice_SetRenderState_Dxt1NoiseEnable = {sec = "D3D", len = 0x77, hash = "0xFBFDDB78543BAFA7", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x19F4, 0x40100, 0x40110], ret = 4, regs = []}
++D3DDevice_SetRenderState_EdgeAntiAlias = {sec = "D3D", len = 0x32, hash = "0x730A89937FD22F33", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x80320], ret = 4, regs = []}
++D3DDevice_SetRenderState_FillMode = {sec = "D3D", len = 0x44, hash = "0xF4CFF32CF2609D44", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x8038C], ret = 4, regs = []}
++D3DDevice_SetRenderState_FogColor = {sec = "D3D", len = 0x4D, hash = "0x1B01BAE4601E76CF", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0xFF, 0x402A8, 0xFF00FF00], ret = 4, regs = []}
++D3DDevice_SetRenderState_FrontFace = {sec = "D3D", len = 0x3A, hash = "0x9BC97623E21CE0ED", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x68, "0x41E41F4067D70FAB", [[0xF, "0x992EC001666B3982"]]]], k = [0x403A0], regs = []}
++D3DDevice_SetRenderState_LineWidth = {sec = "D3D", len = 0x65, hash = "0xE7C69FA32A9BEB0F", calls = [[0x9, "0x5AE13FDFB3B6A4DF", []], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x1FF, 0x1FF, 0x960, 0x40380], ret = 4, regs = []}
++D3DDevice_SetRenderState_LogicOp = {sec = "D3D", len = 0x52, hash = "0x9B9DDE0E59AC0F69", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x417BC, 0x817BC], ret = 4, regs = []}
++D3DDevice_SetRenderState_MultiSampleAntiAlias = {sec = "D3D", len = 0x72, hash = "0x989803ED63A0611F", calls = [[0xEF, "0x56CD241D9A183A2E", [[0x44, "0xE8F129F67AA5166E"], [0x68, "0x48B54173CEF6CCA6"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x1E5, "0x41FF7FD0C959BC75", [[0x122, "0xA656385547294F40"]]]], k = [0x41D7C], ret = 4, regs = []}
++D3DDevice_SetRenderState_MultiSampleMask = {sec = "D3D", len = 0x50, hash = "0x7C55605975C92203", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x41D7C], ret = 4, regs = []}
++D3DDevice_SetRenderState_MultiSampleMode = {sec = "D3D", len = 0x27, hash = "0xA7E9D73954A02807", calls = [[0x355, "0xD4887EAE04D51EF9", [[0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0xF, "0x992EC001666B3982"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0xF, "0x992EC001666B3982"], [0xEF, "0x56CD241D9A183A2E"], [0x222, "0x6A1EA3005318007E"]]]], k = [0x19F4, 0x1A04], ret = 4, regs = []}
++D3DDevice_SetRenderState_MultiSampleRenderTargetMode = {sec = "D3D", len = 0x27, hash = "0x773075413375E5FC", calls = [[0x355, "0xD4887EAE04D51EF9", [[0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0xF, "0x992EC001666B3982"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0xF, "0x992EC001666B3982"], [0xEF, "0x56CD241D9A183A2E"], [0x222, "0x6A1EA3005318007E"]]]], k = [0x19F4, 0x1A04], ret = 4, regs = []}
++D3DDevice_SetRenderState_NormalizeNormals = {sec = "D3D", len = 0x39, hash = "0x1289F499D4F87D6B", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x200, 0x403A4], ret = 4, regs = []}
++D3DDevice_SetRenderState_OcclusionCullEnable = {sec = "D3D", len = 0x62, hash = "0x19BF8BE1EEFC19CA", count = 2, nth = 0, deep = true, calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x1E00, 0x41D84], ret = 4, regs = []}
++D3DDevice_SetRenderState_PSTextureModes = {sec = "D3D", len = 0x22, hash = "0x973E3C6AC500F98D", k = [0x78C, 0x4000], ret = 4, regs = []}
++D3DDevice_SetRenderState_RopZCmpAlwaysRead = {sec = "D3D", len = 0x11, hash = "0x4F7F4A773101B2F1", count = 3, nth = 0, deep = true, calls = [[0xCE, "0x1D8C3FA32843A29F", [[0xF, "0x992EC001666B3982"]]]], ret = 4, regs = []}
++D3DDevice_SetRenderState_RopZRead = {sec = "D3D", len = 0x11, hash = "0x4F7F4A773101B2F1", count = 3, nth = 1, deep = true, calls = [[0xCE, "0x1D8C3FA32843A29F", [[0xF, "0x992EC001666B3982"]]]], ret = 4, regs = []}
++D3DDevice_SetRenderState_SampleAlpha = {sec = "D3D", len = 0x4E, hash = "0x9D28589E68B988EC", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x41D7C], ret = 4, regs = []}
++D3DDevice_SetRenderState_ShadowFunc = {sec = "D3D", len = 0x35, hash = "0xF346C616C28FF5C3", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x41E6C, 0xFFFFFE00], ret = 4, regs = []}
++D3DDevice_SetRenderState_Simple = {sec = "D3D", len = 0x27, hash = "0xFD83B1F6F3776DB0", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], ret = 0, regs = ["ecx", "edx"]}
++D3DDevice_SetRenderState_StencilCullEnable = {sec = "D3D", len = 0x62, hash = "0x19BF8BE1EEFC19CA", count = 2, nth = 1, deep = true, calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x1E00, 0x41D84], ret = 4, regs = []}
++D3DDevice_SetRenderState_StencilEnable = {sec = "D3D", len = 0x84, hash = "0xEA0058ADF5EB1561", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x19F8, 0x1E00, 0x4032C, 0x41D84], ret = 4, regs = []}
++D3DDevice_SetRenderState_StencilFail = {sec = "D3D", len = 0x6D, hash = "0x1AC579E0A6FC138", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x1E00, 0x40370, 0x41D84], ret = 4, regs = []}
++D3DDevice_SetRenderState_TextureFactor = {sec = "D3D", len = 0x51, hash = "0x113C472742A66A98", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x780], ret = 4, regs = []}
++D3DDevice_SetRenderState_TwoSidedLighting = {sec = "D3D", len = 0x80, hash = "0x39AD22A0DC7D1BC3", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x9000, 0x417C4, 0x8038C], ret = 4, regs = []}
++D3DDevice_SetRenderState_VertexBlend = {sec = "D3D", len = 0x41, hash = "0x9009C90948A65018", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x200, 0x40328], ret = 4, regs = []}
++D3DDevice_SetRenderState_YuvEnable = {sec = "D3D", len = 0x2B, hash = "0x9F44B45404A3EE4B", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x59, "0x4C637B76250200FF", []]], ret = 4, regs = []}
++D3DDevice_SetRenderState_ZEnable = {sec = "D3D", len = 0x8F, hash = "0x70FE372A518CA19C", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x140, "0xE7D0D459A6168D96", [[0xFA, "0xFB0FEB1CD8F3F37D"]]], [0xEF, "0x56CD241D9A183A2E", [[0x44, "0xE8F129F67AA5166E"], [0x68, "0x48B54173CEF6CCA6"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x59, "0x4C637B76250200FF", []], [0x1E5, "0x41FF7FD0C959BC75", [[0x122, "0xA656385547294F40"]]]], k = [0x19F8, 0x4030C, 0x41D78], ret = 4, regs = []}
++D3DDevice_SetRenderTarget = {sec = "D3D", len = 0x274, hash = "0x8E3AE1F77F73351E", calls = [[0x32, "0x79A41FE5E122B9C", []], [0x62, "0x39DF67CEF83C99D2", [[0x91, "0x2B608654E08CF536"], [0x91, "0x2B608654E08CF536"]]], [0x62, "0x39DF67CEF83C99D2", [[0x91, "0x2B608654E08CF536"], [0x91, "0x2B608654E08CF536"]]], [0x32, "0x79A41FE5E122B9C", []], [0x12, "0x3CF97E0F4C449D89", []], [0x65, "0xC1AD19302E02169A", []], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x59, "0x4C637B76250200FF", []], [0x16, "0x1DBD5577E019815D", []], [0x355, "0xD4887EAE04D51EF9", [[0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0xF, "0x992EC001666B3982"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0xF, "0x992EC001666B3982"], [0xEF, "0x56CD241D9A183A2E"], [0x222, "0x6A1EA3005318007E"]]], [0x77, "0xFBFDDB78543BAFA7", [[0xF, "0x992EC001666B3982"]]]], k = [0x944, 0x948, 0x948, 0x19F4, 0x19F4, 0x19F4, 0x19F4, 0x19F8, 0x19F8, 0x19F8, 0x19F8, 0x19F8, 0x19FC, 0x1A04, 0xFFFF, 0x40100, 0x40110, 0x40130, 0x4020C, 0x40210, 0x40214, 0x4030C, 0x4032C, 0xFFFFFEFF], ret = 8, regs = []}
++D3DDevice_SetRenderTargetFast = {}
++D3DDevice_SetScissors = {sec = "D3D", len = 0x300, hash = "0x72ABA04D47D208FB", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []]], k = [0x950, 0x950, 0x954, 0x954, 0x958, 0x95C, 0xED0, 0xED0, 0xED4, 0xED4, 0xED8, 0xED8, 0xEDC, 0xEDC, 0x1B70, 0x1BF0, 0x1BF4, 0x402B4, 0x402B4, 0x402C0, 0x402E0, 0x402E0, 0x80200, 0x80200], ret = 12, regs = []}
++D3DDevice_SetScreenSpaceOffset = {sec = "D3D", len = 0x49, hash = "0x1B7DEE10C8373042", calls = [[0xEF, "0x56CD241D9A183A2E", [[0x44, "0xE8F129F67AA5166E"], [0x68, "0x48B54173CEF6CCA6"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x1E5, "0x41FF7FD0C959BC75", [[0x122, "0xA656385547294F40"]]]], k = [0xEE8, 0xEEC], ret = 8, regs = []}
++D3DDevice_SetShaderConstantMode = {sec = "D3D", len = 0x118, hash = "0x2CF5192385C30787", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x70, "0x7D9C5AF64969EA58", []], [0x70, "0x7D9C5AF64969EA58", []], [0x70, "0x7D9C5AF64969EA58", []], [0x70, "0x7D9C5AF64969EA58", []]], k = [0x44, 0x88, 0xCC, 0x110, 0x114, 0x118, 0x11C, 0x120, 0x124, 0x128, 0x12C, 0x130, 0x134, 0x138, 0x200, 0x1600, 0x1918, 0x41EA4, 0x1009D0, 0x100A50, 0x3F800000, 0xFFFFFDFF], ret = 4, regs = []}
++D3DDevice_SetSoftDisplayFilter = {sec = "D3D", len = 0x51, hash = "0x406A18ECA7EDB8BB", k = [0x1C18], ret = 4, regs = []}
++D3DDevice_SetStreamSource = {sec = "D3D", len = 0x8C, hash = "0xD74EC7BFECBC9B20", calls = [[0x91, "0x2B608654E08CF536", [[0x78, "0x435EB75785E123C"], [0x4B, "0xDB57BC295008F50C"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"]]]], k = [0x40, 0x70, 0x80000, 0xFFF80000], ret = 12, regs = []}
++D3DDevice_SetTexture = {sec = "D3D", len = 0x1A4, hash = "0xDDD090E2A67F1ACB", calls = [[0x91, "0x2B608654E08CF536", [[0x78, "0x435EB75785E123C"], [0x4B, "0xDB57BC295008F50C"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x770, 0x800, 0xF78, 0xF78, 0xFFF, 0xFFF, 0x206C, 0x20F4, 0x2A00, 0x3100, 0x4000, 0x4800, 0xFF00, 0x41B0C, 0x41B0C, 0x41B10, 0x41B1C, 0x80000, 0x40000000, 0x80000000, 0xFFF80000, 0xFFFFDFFF], ret = 8, regs = []}
++D3DDevice_SetTextureStageStateNotInline = {sec = "D3D", len = 0xEC, hash = "0x52377A3E3E06600C", calls = [[0x105, "0xAEE9434DB6BFC725", [[0xF, "0x992EC001666B3982"]]], [0x3D, "0xAD4A3146467D1DCD", [[0xF, "0x992EC001666B3982"]]], [0x39, "0xA293CC3B791733F7", [[0xF, "0x992EC001666B3982"]]], [0x63, "0xFDDE907FE002FE47", [[0xF, "0x992EC001666B3982"]]]], k = [0x480F, 0xFFFFBFF1], ret = 12, regs = []}
++D3DDevice_SetTextureState_BorderColor = {sec = "D3D", len = 0x3D, hash = "0xAD4A3146467D1DCD", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x41B24], ret = 8, regs = []}
++D3DDevice_SetTextureState_BumpEnv = {sec = "D3D", len = 0x63, hash = "0xFDDE907FE002FE47", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x780, 0x41AD0], ret = 12, regs = []}
++D3DDevice_SetTextureState_ColorKeyColor = {sec = "D3D", len = 0x39, hash = "0xA293CC3B791733F7", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x40AE0], ret = 8, regs = []}
++D3DDevice_SetTextureState_TexCoordIndex = {sec = "D3D", len = 0x105, hash = "0xAEE9434DB6BFC725", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x200, 0x47F, 0x94C, 0x94C, 0x94C, 0x2400, 0x2401, 0x8511, 0x8512, 0xC03C, 0x30000, 0x41964, 0xFF000000, 0xFFFF0000], ret = 8, regs = []}
++D3DDevice_SetTile = {}
++D3DDevice_SetTransform = {sec = "D3D", len = 0x118, hash = "0xD8A20756670F32FA", calls = [[0x140, "0xE7D0D459A6168D96", [[0xFA, "0xFB0FEB1CD8F3F37D"]]], [0xEF, "0x56CD241D9A183A2E", [[0x44, "0xE8F129F67AA5166E"], [0x68, "0x48B54173CEF6CCA6"]]]], k = [0x44, 0x44, 0x44, 0x44, 0x44, 0x938, 0x938, 0x93C, 0x93C, 0x93C, 0x940, 0xC50, 0x3F800000], ret = 8, regs = []}
++D3DDevice_SetVertexShader = {sec = "D3D", len = 0x163, hash = "0x1FD991BCFFC714C9", calls = [[0x54, "0xB8308BF8A033EFAE", [[0xAE, "0xA78B15FFEFF2AD11"], [0x44, "0xE8F129F67AA5166E"]]], [0x9C, "0xE249CDCCC3C59055", [[0xF, "0x992EC001666B3982"], [0x1E5, "0x41FF7FD0C959BC75"], [0xF, "0x992EC001666B3982"]]], [0x139, "0x59D35C41E6742F40", []], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x1E5, "0x41FF7FD0C959BC75", [[0x122, "0xA656385547294F40"]]], [0xEF, "0x56CD241D9A183A2E", [[0x44, "0xE8F129F67AA5166E"], [0x68, "0x48B54173CEF6CCA6"]]], [0x1E5, "0x41FF7FD0C959BC75", [[0x122, "0xA656385547294F40"]]]], k = [0x70, 0x400, 0x790, 0x790, 0x794, 0x798, 0x1600, 0x4194C, 0x41950, 0x4195C, 0x41960, 0x41E94, 0x41EA0, 0x81E94], ret = 4, regs = []}
++D3DDevice_SetVertexShaderConstant1 = {sec = "D3D", len = 0x5F, hash = "0x9E0CE9E5B849724D", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x41EA4, 0x100B80], ret = 0, regs = ["ecx", "edx"]}
++D3DDevice_SetVertexShaderConstant1Fast = {sec = "D3D", len = 0x49, hash = "0x5D379D76B2CE01ED", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x41EA4, 0x100B80], ret = 0, regs = ["ecx", "edx"]}
++D3DDevice_SetVertexShaderConstant4 = {sec = "D3D", len = 0xA2, hash = "0xB4864F9B11A50016", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x4C, 0x41EA4], ret = 0, regs = ["ecx", "edx"]}
++D3DDevice_SetVertexShaderConstantNotInlineFast = {sec = "D3D", len = 0xD0, hash = "0x7FB80A656C3E3607", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], k = [0x40, 0x40, 0x44, 0x60, 0xB80, 0x41EA4], ret = 4, regs = ["ecx", "edx"]}
++D3DDevice_SetViewport = {sec = "D3D", len = 0x222, hash = "0x6A1EA3005318007E", calls = [[0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x9, "0x5AE13FDFB3B6A4DF", []], [0x300, "0x72ABA04D47D208FB", [[0xF, "0x992EC001666B3982"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"], [0x9, "0x5AE13FDFB3B6A4DF"]]], [0x140, "0xE7D0D459A6168D96", [[0xFA, "0xFB0FEB1CD8F3F37D"]]], [0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0x1E5, "0x41FF7FD0C959BC75", [[0x122, "0xA656385547294F40"]]]], k = [0x100, 0x950, 0x954, 0x958, 0x958, 0x95C, 0x95C, 0xED0, 0xED4, 0xED8, 0xEDC, 0xEE0, 0xEE4, 0xFFF, 0xFFF, 0xFFF, 0xFFF, 0x19F4, 0x1A04, 0x1A08], ret = 4, regs = []}
++D3DDevice_Swap = {sec = "D3D", len = 0xE5, hash = "0x2BEF2C5601D1F63", calls = [[0x8C, "0xE603E640D4031FC7", []], [0xAB, "0xCC21394CADEBA5EF", [[0xF, "0x992EC001666B3982"], [0xB0, "0xC9801DB361BC6F1"]]], [0x16A, "0xD827AF39CDE2463", [[0xAB, "0xCC21394CADEBA5EF"], [0xFE, "0x7E39208E4974425D"], [0x78, "0xE1BF81B48009F9DA"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"]]], [0x1E5, "0xAD4C65DD5F49E5C5", [[0x8A, "0xDE16FEFFA2A7FE53"], [0x274, "0x8E3AE1F77F73351E"], [0x1A4, "0xDDD090E2A67F1ACB"], [0x1A4, "0xDDD090E2A67F1ACB"], [0x1A4, "0xDDD090E2A67F1ACB"], [0x1A4, "0xDDD090E2A67F1ACB"], [0xDF, "0x9D7B08F674E5B546"], [0x117, "0xEDE5BF2A1320C993"], [0xF, "0x992EC001666B3982"], [0x17B, "0x6D6C88E6FC98C79"], [0x17D, "0xDD27959FA5951C71"], [0x68, "0x96521783EE27586D"], [0xF, "0x992EC001666B3982"]]], [0xAB, "0xCC21394CADEBA5EF", [[0xF, "0x992EC001666B3982"], [0xB0, "0xC9801DB361BC6F1"]]], [0x16A, "0xD827AF39CDE2463", [[0xAB, "0xCC21394CADEBA5EF"], [0xFE, "0x7E39208E4974425D"], [0x78, "0xE1BF81B48009F9DA"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"]]], [0x104, "0x5460A6903DBA24FA", [[0xF, "0x992EC001666B3982"]]], [0x40, "0x125E771871BD38FC", [[0xAB, "0xCC21394CADEBA5EF"], [0x116, "0x59741D516583140D"]]], [0x564, "0xD6B208FCBEEEA0F3", [[0x1A, "0x4912EEE9E91F1F15"], [0x14, "0x83E1D8D0BFEED376"], [0x34, "0xD5693061AEFA35A4"], [0xAA, "0x26810E04323EEB4A"], [0x43, "0x23E4CC19296786D0"], [0x4D, "0x793EFFDBA3CC3CA7"], [0x65, "0xC1AD19302E02169A"], [0x65, "0xC1AD19302E02169A"], [0x4E, "0x1F36E2BD67978483"], [0xA0, "0x5A415716A87528E0"], [0xF4, "0xC803051E6BD52F1B"], [0x28, "0x1E9DB1E0296AC893"], [0x33, "0x957C5B5C51604B83"], [0xC8, "0xCD9420209525A177"], [0x84, "0xE57A19FF2A1427E"], [0xC8, "0xCD9420209525A177"], [0xE, "0x972EB562F739465D"], [0x37B, "0x3E90DD4E773D204A"], [0x58, "0x699795E3607C7554"], [0x12, "0x756CE65CF0761A6"], [0x33, "0x957C5B5C51604B83"], [0x33, "0x957C5B5C51604B83"]]]], k = [0x40, 0x8D0, 0x8D0, 0x8D4, 0x8D4, 0x1964, 0x1964, 0x2468, 0x2468, 0x2468, 0x2468, 0x2468], ret = 4, regs = []}
++D3DDevice_SwitchTexture = {sec = "D3D", len = 0x30, hash = "0x77FFE269C986D336", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]]], ret = 4, regs = ["ecx", "edx"]}
++D3DResource_BlockUntilNotBusy = {}
++D3DResource_IsBusy = {}
++D3D_BlockOnResource = {sec = "D3D", len = 0x78, hash = "0x435EB75785E123C", calls = [[0x35, "0xCBE7179F091C68C3", []], [0x16A, "0xD827AF39CDE2463", [[0xAB, "0xCC21394CADEBA5EF"], [0xFE, "0x7E39208E4974425D"], [0x78, "0xE1BF81B48009F9DA"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"]]], [0x35, "0xCBE7179F091C68C3", []], [0x16A, "0xD827AF39CDE2463", [[0xAB, "0xCC21394CADEBA5EF"], [0xFE, "0x7E39208E4974425D"], [0x78, "0xE1BF81B48009F9DA"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"]]], [0x16A, "0xD827AF39CDE2463", [[0xAB, "0xCC21394CADEBA5EF"], [0xFE, "0x7E39208E4974425D"], [0x78, "0xE1BF81B48009F9DA"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"]]]], k = [0x50000, 0x70000], ret = 4, regs = []}
++D3D_BlockOnTime = {sec = "D3D", len = 0x16A, hash = "0xD827AF39CDE2463", calls = [[0xAB, "0xCC21394CADEBA5EF", [[0xF, "0x992EC001666B3982"], [0xB0, "0xC9801DB361BC6F1"]]], [0xFE, "0x7E39208E4974425D", []], [0x78, "0xE1BF81B48009F9DA", [[0xFE, "0x7E39208E4974425D"]]], [0x78, "0xE1BF81B48009F9DA", [[0xFE, "0x7E39208E4974425D"]]], [0x2F, "0xADDEEE05B19EF026", []], [0x2D, "0x1488B3B74605AC25", []], [0x78, "0xE1BF81B48009F9DA", [[0xFE, "0x7E39208E4974425D"]]], [0x2F, "0xADDEEE05B19EF026", []], [0x2D, "0x1488B3B74605AC25", []]], k = [0x40, 0x40, 0x19EC, 0x19EC, 0x19F0, 0x19F0, 0x1DBC, 0x1DC0, 0x2000, 0x2000, 0x2400, 0x40100, 0x40100, 0x40110, 0x80000000], ret = 8, regs = []}
++D3D_InitDefaultState = {sec = "D3D", len = 0xC2, hash = "0xCF4442034909879D", calls = [[0x118, "0xD8A20756670F32FA", [[0x140, "0xE7D0D459A6168D96"], [0xEF, "0x56CD241D9A183A2E"]]], [0x5D, "0xA914C7CD799F4C2E", [[0x27, "0xFD83B1F6F3776DB0"]]], [0x5D, "0xA914C7CD799F4C2E", [[0x27, "0xFD83B1F6F3776DB0"]]], [0xEC, "0x52377A3E3E06600C", [[0x105, "0xAEE9434DB6BFC725"], [0x3D, "0xAD4A3146467D1DCD"], [0x39, "0xA293CC3B791733F7"], [0x63, "0xFDDE907FE002FE47"]]], [0xEC, "0x52377A3E3E06600C", [[0x105, "0xAEE9434DB6BFC725"], [0x3D, "0xAD4A3146467D1DCD"], [0x39, "0xA293CC3B791733F7"], [0x63, "0xFDDE907FE002FE47"]]], [0x1A4, "0xDDD090E2A67F1ACB", [[0x91, "0x2B608654E08CF536"], [0xF, "0x992EC001666B3982"], [0xF, "0x992EC001666B3982"]]], [0xEC, "0x52377A3E3E06600C", [[0x105, "0xAEE9434DB6BFC725"], [0x3D, "0xAD4A3146467D1DCD"], [0x39, "0xA293CC3B791733F7"], [0x63, "0xFDDE907FE002FE47"]]], [0xEC, "0x52377A3E3E06600C", [[0x105, "0xAEE9434DB6BFC725"], [0x3D, "0xAD4A3146467D1DCD"], [0x39, "0xA293CC3B791733F7"], [0x63, "0xFDDE907FE002FE47"]]], [0x49, "0x1B7DEE10C8373042", [[0xEF, "0x56CD241D9A183A2E"], [0xF, "0x992EC001666B3982"], [0x1E5, "0x41FF7FD0C959BC75"]]]], k = [0x7E, 0x7F, 0x9A, 0xA6, 0x1A10], ret = 0, regs = []}
++D3D_InternalAddRef = {sec = "D3D", len = 0x32, hash = "0x79A41FE5E122B9C", k = [0x50000, 0x70000, 0x80000, 0x80000], ret = 4, regs = []}
++D3D_InternalRelease = {sec = "D3D", len = 0x62, hash = "0x39DF67CEF83C99D2", calls = [[0x91, "0x2B608654E08CF536", [[0x78, "0x435EB75785E123C"], [0x4B, "0xDB57BC295008F50C"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"]]], [0x91, "0x2B608654E08CF536", [[0x78, "0x435EB75785E123C"], [0x4B, "0xDB57BC295008F50C"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"]]]], k = [0xFFFF, 0x50000, 0x70000, 0x80000, 0xFFF80000, 0xFFF80000], ret = 4, regs = []}
++D3D_KickOffAndWaitForIdle = {sec = "D3D", len = 0x11, hash = "0x8D6E8C4F5C3417EB", calls = [[0x16A, "0xD827AF39CDE2463", [[0xAB, "0xCC21394CADEBA5EF"], [0xFE, "0x7E39208E4974425D"], [0x78, "0xE1BF81B48009F9DA"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"]]]], ret = 0, regs = []}
++D3D_MakeRequestedSpace = {sec = "D3D", len = 0x136, hash = "0xD793887F7358EC80", calls = [[0x49, "0x92FE8F574A61F335", []], [0x16A, "0xD827AF39CDE2463", [[0xAB, "0xCC21394CADEBA5EF"], [0xFE, "0x7E39208E4974425D"], [0x78, "0xE1BF81B48009F9DA"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"], [0x78, "0xE1BF81B48009F9DA"], [0x2F, "0xADDEEE05B19EF026"], [0x2D, "0x1488B3B74605AC25"]]], [0xB0, "0xC9801DB361BC6F1", [[0x2F, "0x57A04D95FBC2B960"]]], [0xAB, "0xCC21394CADEBA5EF", [[0xF, "0x992EC001666B3982"], [0xB0, "0xC9801DB361BC6F1"]]], [0xB0, "0xC9801DB361BC6F1", [[0x2F, "0x57A04D95FBC2B960"]]]], k = [0x40, 0x40, 0x44, 0x760, 0x764, 0x764, 0x1000, 0x4000, 0xFFFFFFF, 0xFFFFFDFC], ret = 8, regs = []}
++D3D_SetFence = {sec = "D3D", len = 0xAB, hash = "0xCC21394CADEBA5EF", calls = [[0xF, "0x992EC001666B3982", [[0x136, "0xD793887F7358EC80"]]], [0xB0, "0xC9801DB361BC6F1", [[0x2F, "0x57A04D95FBC2B960"]]]], k = [0x44, 0x44, 0x60, 0x64, 0x41D70, 0x41D90, 0x4A310], ret = 4, regs = []}
++Direct3D_CreateDevice = {sec = "D3D", len = 0xA4, hash = "0xEF5C595A360FB399", calls = [[0x4C5, "0xF650B2B8A7CD0710", [[0xA0, "0x5A415716A87528E0"], [0xA0, "0x358889557D097D1E"], [0x162, "0x4DFB94DDED45E91B"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0xCF, "0x50F7888641891089"], [0x63, "0xEC7AF7FB749DEE2D"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x34, "0x7EB32B35DDE5C5BF"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0x90, "0x827F948918F7AFC"], [0xB0, "0xC9801DB361BC6F1"], [0x13, "0x235EF259267EA24E"], [0x108, "0x450AD52B321F9B6F"], [0x596, "0xE819C12150D26A2D"], [0x65, "0xC1AD19302E02169A"], [0x265, "0x780CFAE836627E8D"], [0xAB, "0xCC21394CADEBA5EF"], [0x2F, "0x57A04D95FBC2B960"], [0x163, "0x1FD991BCFFC714C9"], [0x163, "0x1FD991BCFFC714C9"], [0x274, "0x8E3AE1F77F73351E"], [0xC2, "0xCF4442034909879D"], [0x39F, "0x54A8713B4314A86"], [0x42, "0xEAC8B3B49C7737F5"], [0x51, "0x406A18ECA7EDB8BB"]]], [0x1AC, "0xE5D40671DFEE1FD2", [[0x11, "0x8D6E8C4F5C3417EB"], [0xB0, "0xC9801DB361BC6F1"], [0x13, "0x235EF259267EA24E"], [0x11, "0xDF13E8CDCC5CA945"], [0x12F, "0xCD2E03AC37C61FBC"], [0x29, "0x319393B2F93CC9F9"], [0x91, "0x2B608654E08CF536"], [0x91, "0x2B608654E08CF536"], [0x91, "0x2B608654E08CF536"], [0x91, "0x2B608654E08CF536"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"], [0x1BC, "0xB3BBA59ADBDB1500"]]]], k = [0x924, 0x8000, 0x80000], ret = 24, regs = []}
++DirectSoundCreate = {sec = "DSOUND", len = 0x47, hash = "0x3BBCDFE434237F24", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x6D, "0x5B6DF29981072B31", [[0x15, "0xA06C401FA8F9EA12"], [0x11, "0x2B6130851883E06E"], [0x1D, "0x936A8E6B64B4B1F7"], [0x139, "0x2EA6C150A764F0C8"]]]], ret = 12, regs = []}
++DirectSoundCreateBuffer = {sec = "DSOUND", len = 0x57, hash = "0xC2431935FBC2C56E", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x6D, "0x5B6DF29981072B31", [[0x15, "0xA06C401FA8F9EA12"], [0x11, "0x2B6130851883E06E"], [0x1D, "0x936A8E6B64B4B1F7"], [0x139, "0x2EA6C150A764F0C8"]]], [0x9C, "0x71DC342A694E3431", [[0x1E, "0x77CF69460E7107DD"], [0x11, "0x2B6130851883E06E"], [0x18, "0x7267DDD0F33D17E1"], [0xE7, "0x4386FBCF796CD309"]]]], ret = 8, regs = []}
++DirectSoundCreateStream = {sec = "DSOUND", len = 0x57, hash = "0xC2431935FBC2C56E", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x6D, "0x5B6DF29981072B31", [[0x15, "0xA06C401FA8F9EA12"], [0x11, "0x2B6130851883E06E"], [0x1D, "0x936A8E6B64B4B1F7"], [0x139, "0x2EA6C150A764F0C8"]]], [0x91, "0xA8084C901AC7275A", [[0x1E, "0x77CF69460E7107DD"], [0x11, "0x2B6130851883E06E"], [0x25, "0xA8574C55272D2AC1"], [0xAA, "0x4BB4CB7B01AD6A56"]]]], ret = 8, regs = []}
++DirectSoundDoWork = {sec = "DSOUND", len = 0x29, hash = "0x3F0CD1C7D0D542BB", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x31, "0x5A90CBA1AACC1ADD", [[0x1E, "0x77CF69460E7107DD"], [0x92, "0xA27D3FDC1C6FC8BE"]]]], ret = 0, regs = []}
++DirectSoundUseFullHRTF = {}
++DirectSoundUseLightHRTF = {sec = "DSOUND", len = 0x1F, hash = "0x25F67F3123B157A9", calls = [[0x1E, "0x77CF69460E7107DD", []], [0x6F, "0x706E67C92A322806", []]], ret = 0, regs = []}
++IDirectSoundBuffer_GetCurrentPosition = {sec = "DSOUND", len = 0x20, hash = "0x58625E847EC088E7", calls = [[0x55, "0xE60F054C4E847816", [[0x1E, "0x77CF69460E7107DD"], [0xDF, "0xF5D997D8305769ED"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_GetStatus = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x51, "0xBCCF9F0C46F7ABDF", [[0x1E, "0x77CF69460E7107DD"], [0x42, "0xAC82B5929C476085"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_Lock = {sec = "DSOUND", len = 0x30, hash = "0x5B6EA09A2CCF537D", calls = [[0xE2, "0x1E0C3D10AF47B37D", [[0x1E, "0x77CF69460E7107DD"], [0x55, "0xE60F054C4E847816"]]]], ret = 32, regs = []}
++IDirectSoundBuffer_Pause = {}
++IDirectSoundBuffer_Play = {sec = "DSOUND", len = 0x24, hash = "0x16089413899A14CC", calls = [[0x51, "0x9C8E2BA2A67E258F", [[0x1E, "0x77CF69460E7107DD"], [0xB0, "0x5D41E5249A8F3D04"]]]], ret = 16, regs = []}
++IDirectSoundBuffer_Release = {sec = "DSOUND", len = 0x16, hash = "0x4FA5AC4A92DAE1E3", ret = 4, regs = []}
++IDirectSoundBuffer_SetAllParameters = {}
++IDirectSoundBuffer_SetBufferData = {sec = "DSOUND", len = 0x20, hash = "0x58625E847EC088E7", calls = [[0xAE, "0x69BB93C1FC1404CE", [[0x1E, "0x77CF69460E7107DD"], [0x31, "0xC96EAFC107098818"], [0x8C, "0x7CCE0F3D8E824EA6"], [0x1A, "0xBEAA27CDE7C45CEC"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_SetCurrentPosition = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x51, "0xBCCF9F0C46F7ABDF", [[0x1E, "0x77CF69460E7107DD"], [0xF6, "0x2AE64D2F6081CD67"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_SetEG = {}
++IDirectSoundBuffer_SetFilter = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x13, "0xA418278C66399EC4"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_SetFormat = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x44, "0xCBCFECA2475089F0"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_SetFrequency = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x24, "0xC046BA53B861F640"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_SetHeadroom = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x23, "0x7AD49519FCD1508B"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_SetI3DL2Source = {}
++IDirectSoundBuffer_SetLoopRegion = {sec = "DSOUND", len = 0x20, hash = "0x58625E847EC088E7", calls = [[0x85, "0x92331966BB31BD20", [[0x1E, "0x77CF69460E7107DD"], [0x1E, "0x55A9B42BDFAA965A"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_SetMaxDistance = {sec = "DSOUND", len = 0x24, hash = "0x3853FB9A0AFFA05F", deep = true, calls = [[0x56, "0x72D9FAB119B88023", [[0x1E, "0x77CF69460E7107DD"], [0x33, "0x887649138A711352"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_SetMinDistance = {sec = "DSOUND", len = 0x24, hash = "0x3853FB9A0AFFA05F", deep = true, calls = [[0x56, "0x72D9FAB119B88023", [[0x1E, "0x77CF69460E7107DD"], [0x33, "0xB7A8D8285F28C766"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_SetMixBinVolumes = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", count = 2, nth = 0, deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x1D, "0x47CDFFB8109088B7"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_SetMixBins = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", count = 2, nth = 1, deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x1D, "0x47CDFFB8109088B7"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_SetMode = {sec = "DSOUND", len = 0x20, hash = "0x58625E847EC088E7", calls = [[0x52, "0xA3DA2686A7BE392F", [[0x1E, "0x77CF69460E7107DD"], [0x33, "0x5921FE1D224A0C5E"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_SetNotificationPositions = {sec = "DSOUND", len = 0x20, hash = "0x58625E847EC088E7", calls = [[0x65, "0xB2B7AEB6DB1418C", [[0x1E, "0x77CF69460E7107DD"], [0xD5, "0x5241A53EAB01DA68"], [0x54, "0xB9E650C74433FC9D"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_SetOutputBuffer = {}
++IDirectSoundBuffer_SetPitch = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x19, "0xCEC36E92D765A281"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_SetPlayRegion = {}
++IDirectSoundBuffer_SetPosition = {sec = "DSOUND", len = 0x35, hash = "0xA75396ED26FDDEF8", deep = true, calls = [[0x67, "0xFA99C6F0228DF751", [[0x1E, "0x77CF69460E7107DD"], [0x52, "0x273127244439651"]]]], ret = 20, regs = []}
++IDirectSoundBuffer_SetRolloffCurve = {}
++IDirectSoundBuffer_SetRolloffFactor = {sec = "DSOUND", len = 0x24, hash = "0x3853FB9A0AFFA05F", deep = true, calls = [[0x56, "0x72D9FAB119B88023", [[0x1E, "0x77CF69460E7107DD"], [0x33, "0x9DBA20D526EC80CA"]]]], ret = 12, regs = []}
++IDirectSoundBuffer_SetVelocity = {sec = "DSOUND", len = 0x35, hash = "0xA75396ED26FDDEF8", deep = true, calls = [[0x67, "0xFA99C6F0228DF751", [[0x1E, "0x77CF69460E7107DD"], [0x52, "0x495D5179D16421CE"]]]], ret = 20, regs = []}
++IDirectSoundBuffer_SetVolume = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", deep = true, calls = [[0x4E, "0xE46B8FDA6F8BD284", [[0x1E, "0x77CF69460E7107DD"], [0x1C, "0xFC6E09B4AD4AB568"]]]], ret = 8, regs = []}
++IDirectSoundBuffer_Stop = {sec = "DSOUND", len = 0x18, hash = "0x6B88620E3F09B885", calls = [[0x4F, "0x8E32B086615BD924", [[0x1E, "0x77CF69460E7107DD"], [0x90, "0x2AE5DA762CB3B590"]]]], ret = 4, regs = []}
++IDirectSoundBuffer_StopEx = {}
++IDirectSoundBuffer_Unlock = {sec = "DSOUND", len = 0x5, hash = "0x94773B53804784A", ret = 20, regs = []}
++IDirectSoundStream_SetEG = {}
++IDirectSound_CommitDeferredSettings = {sec = "DSOUND", len = 0x18, hash = "0x1170ED95F94B6D21", calls = [[0x9A, "0x46195814CF28FEA9", [[0x1E, "0x77CF69460E7107DD"], [0x25, "0x14163B51FDB298C"], [0x240, "0x65DA9BE004D93BEB"], [0xB7, "0x1DDF65497D36DFB3"], [0x11, "0x36322341293944C0"], [0x1E, "0x38D1F03FFD1B5C9C"]]]], ret = 4, regs = []}
++IDirectSound_CommitEffectData = {}
++IDirectSound_CreateSoundBuffer = {sec = "DSOUND", len = 0x24, hash = "0xBBF11F9B43DBC968", calls = [[0x9C, "0x71DC342A694E3431", [[0x1E, "0x77CF69460E7107DD"], [0x11, "0x2B6130851883E06E"], [0x18, "0x7267DDD0F33D17E1"], [0xE7, "0x4386FBCF796CD309"]]]], ret = 16, regs = []}
++IDirectSound_DownloadEffectsImage = {sec = "DSOUND", len = 0x27, hash = "0xE0165516ACA00EEE", calls = [[0x64, "0x38E54145D1415FCA", [[0x1E, "0x77CF69460E7107DD"], [0x22, "0x269F4DF9DEC8FBD2"], [0x2F, "0x9F4562C77D21CE82"]]]], ret = 20, regs = []}
++IDirectSound_EnableHeadphones = {}
++IDirectSound_GetEffectData = {}
++IDirectSound_GetOutputLevels = {}
++IDirectSound_GetSpeakerConfig = {}
++IDirectSound_Release = {sec = "DSOUND", len = 0x16, hash = "0xF58E37D24D1C967F", ret = 4, regs = []}
++IDirectSound_SetDistanceFactor = {}
++IDirectSound_SetDopplerFactor = {sec = "DSOUND", len = 0x24, hash = "0xDE3C8721C54154FB", calls = [[0x5F, "0x2698B06DFBFB1EF1", [[0x1E, "0x77CF69460E7107DD"], [0x9A, "0x46195814CF28FEA9"]]]], ret = 12, regs = []}
++IDirectSound_SetEffectData = {sec = "DSOUND", len = 0x2A, hash = "0x76D2C0E797675B97", calls = [[0x62, "0x3DB83A86E5CE6F39", [[0x1E, "0x77CF69460E7107DD"], [0xA9, "0xE757D724F9BF8D0"]]]], ret = 24, regs = []}
++IDirectSound_SetI3DL2Listener = {sec = "DSOUND", len = 0x20, hash = "0xFE4AEA0C39023D83", calls = [[0x108, "0xC701FEDC17EE4A4B", [[0x1E, "0x77CF69460E7107DD"], [0x9A, "0x46195814CF28FEA9"]]]], ret = 12, regs = []}
++IDirectSound_SetMixBinHeadroom = {sec = "DSOUND", len = 0x20, hash = "0xFE4AEA0C39023D83", calls = [[0x5F, "0xBE9802B56C5800D5", [[0x1E, "0x77CF69460E7107DD"], [0x45, "0x120A50522F1CD6E7"]]]], ret = 12, regs = []}
++IDirectSound_SetOrientation = {sec = "DSOUND", len = 0x4A, hash = "0x6E76353342B01D02", calls = [[0x8D, "0x12688B0138845D2D", [[0x1E, "0x77CF69460E7107DD"], [0x9A, "0x46195814CF28FEA9"]]]], ret = 32, regs = []}
++IDirectSound_SetPosition = {sec = "DSOUND", len = 0x35, hash = "0x3963ADF6D5F8D9AC", calls = [[0x73, "0x71B2C07B4741DAA2", [[0x1E, "0x77CF69460E7107DD"], [0x9A, "0x46195814CF28FEA9"]]]], ret = 20, regs = []}
++IDirectSound_SetRolloffFactor = {sec = "DSOUND", len = 0x24, hash = "0xDE3C8721C54154FB", calls = [[0x5F, "0x61F5169A323CA615", [[0x1E, "0x77CF69460E7107DD"], [0x9A, "0x46195814CF28FEA9"]]]], ret = 12, regs = []}
++IDirectSound_SetVelocity = {sec = "DSOUND", len = 0x35, hash = "0x3963ADF6D5F8D9AC", calls = [[0x73, "0x996282AE2A3CF9", [[0x1E, "0x77CF69460E7107DD"], [0x9A, "0x46195814CF28FEA9"]]]], ret = 20, regs = []}
++IDirectSound_SynchPlayback = {}
++Lock2DSurface = {sec = "D3D", len = 0x9B, hash = "0x2CFB04890FE9A81D", calls = [[0x78, "0x435EB75785E123C", [[0x35, "0xCBE7179F091C68C3"], [0x16A, "0xD827AF39CDE2463"], [0x35, "0xCBE7179F091C68C3"], [0x16A, "0xD827AF39CDE2463"], [0x16A, "0xD827AF39CDE2463"]]], [0x223, "0xA77B0A5AB66CBDC1", []]], k = [0x40, 0xF0000000], ret = 24, regs = []}
++WSACancelOverlappedIO = {}
++WSAGetLastError = {}
++WSAGetOverlappedResult = {sec = "XNET", len = 0xF, hash = "0x7D3AA94CE644461D", calls = [[0xD4, "0x9AE8ED7BD8776ACD", [[0x58, "0xFA16DEBCE723F4"], [0x12, "0x756CE65CF0761A6"], [0x52, "0x13F0B7B0587C8ACA"], [0x2E, "0xA4B3020F0A3ABBE1"]]]], regs = []}
++WSARecv = {sec = "XNET", len = 0xF, hash = "0x7D3AA94CE644461D", calls = [[0x9D, "0x2A5354C3F846F20F", [[0x2E, "0xA4B3020F0A3ABBE1"], [0x58, "0xFA16DEBCE723F4"], [0x1BC, "0x9FF169BF6D5F8203"], [0x2E, "0xA4B3020F0A3ABBE1"]]]], regs = []}
++WSARecvFrom = {}
++WSASend = {sec = "XNET", len = 0xF, hash = "0x7D3AA94CE644461D", calls = [[0x9B, "0x2A9E12AC603F1DE6", [[0x2E, "0xA4B3020F0A3ABBE1"], [0x58, "0xFA16DEBCE723F4"], [0x19, "0x36425A0C286A4EE2"], [0x119, "0x642E20A3529DF3E1"], [0x2E, "0xA4B3020F0A3ABBE1"]]]], regs = []}
++WSASendTo = {sec = "XNET", len = 0xF, hash = "0x7D3AA94CE644461D", calls = [[0x113, "0x237B2E04E6686C1", [[0x58, "0xFA16DEBCE723F4"], [0x19, "0x36425A0C286A4EE2"], [0x119, "0xB7881E486D766B5C"], [0x119, "0x642E20A3529DF3E1"], [0x2E, "0xA4B3020F0A3ABBE1"]]]], regs = []}
++WSAStartup = {sec = "XNET", len = 0x1B, hash = "0x6DEE023884977CD6", calls = [[0x206, "0x86ADA8B8456C7617", [[0xE, "0x972EB562F739465D"], [0x30, "0x476A4AB45D1F264A"], [0x30, "0x476A4AB45D1F264A"], [0x30, "0x476A4AB45D1F264A"], [0x30, "0x476A4AB45D1F264A"], [0x30, "0x476A4AB45D1F264A"], [0x12, "0x27AA526358D1135D"], [0x4E, "0xC9B35B6A30FC87A3"], [0x9A, "0xDA496382F4382E04"], [0x47, "0xD2574080FF39F54D"], [0x96, "0x166293C662E9F091"], [0x5A2, "0x879BC2079696EE81"], [0x17, "0xF0D158EB49907293"], [0x44, "0x2F140DABD16F95AC"], [0x31, "0xCB2FB7606ADE4F"], [0x2E, "0xA4B3020F0A3ABBE1"]]]], ret = 8, regs = []}
++XAudioDownloadEffectsImage = {}
++XInitDevices = {sec = "XPP", len = 0x79, hash = "0x8FBA4792BD64DE2A", calls = [[0x5A, "0xB67E5E9A66854898", []], [0x149, "0xAD2F6D73DCAC6586", []], [0xC, "0xE51B784F4912F43", [[0x1C5, "0x45EA4087BCF19DE1"]]], [0xA3, "0xAA0B4FA1D141A9FB", [[0x68, "0xD7FC8F6EE4431777"], [0x30, "0x476A4AB45D1F264A"]]], [0x42, "0x57440CC2F164E4C6", [[0x7D, "0xF16AEFD87941E4D2"]]]], k = [0x5C, 0x5D, 0x60, 0x70], ret = 8, regs = []}
++XInputClose = {sec = "XPP", len = 0xC, hash = "0xE51B784F4912F43", calls = [[0x94, "0x5361F00A05946085", [[0x1E, "0xFF194F8C1EBD8CA5"]]]], ret = 4, regs = []}
++XInputGetState = {sec = "XPP", len = 0x73, hash = "0xE17394FE8915A614", k = [0xA2, 0xA3, 0xA3, 0x48F], ret = 8, regs = []}
++XInputOpen = {sec = "XPP", len = 0x56, hash = "0xADCB23E069376F62", calls = [[0x2B, "0x3AFC17F845C76821", []], [0x2E, "0xA4B3020F0A3ABBE1", []], [0x250, "0x8DA7F66C32AA5A40", [[0x6A, "0xCC56D466B83A74CB"], [0xAB, "0x27AA026C805261A4"], [0xEA, "0x33297B3781D0CB77"], [0x4D, "0xB20D520F33AD3B2F"], [0xEA, "0x33297B3781D0CB77"], [0x6E, "0x396F322CFE0035A0"], [0x94, "0x5361F00A05946085"]]], [0x2E, "0xA4B3020F0A3ABBE1", []]], ret = 16, regs = []}
++XInputSetState = {sec = "XPP", len = 0x33, hash = "0xB8A1EA30C6441E92", calls = [[0x12E, "0x8CC2092C9971EA6C", [[0xEA, "0x33297B3781D0CB77"], [0x6E, "0x396F322CFE0035A0"]]]], k = [0x40, 0x41, 0xA3], ret = 8, regs = []}
++XLaunchNewImageA = {sec = ".text", len = 0x42, hash = "0x900544F31DC8414C", calls = [[0x181, "0x650CD2C0C11D9A25", [[0x47, "0xE2C71FA7B964262E"], [0x92, "0x2BD81DB9A9255D31"], [0x57, "0x4958D27C1B36AE0D"], [0xE1, "0xC9C936E44BC225AB"], [0x81, "0xD7C549D57DD59E5A"]]]], ret = 8, regs = []}
++XMountUtilityDrive = {sec = ".text", len = 0x105, hash = "0xAE7D3CB029BED347", calls = [[0x24B, "0x98B8D31E68F56A84", [[0x1EF, "0x32A3F7F2C76D9465"]]], [0x57, "0x4958D27C1B36AE0D", [[0x767, "0xEDA17BCF9B61B7DE"], [0x116, "0x865EB383218951EF"]]], [0x324, "0xD90EEBF06A2E2D78", [[0x17, "0x5A64BF0410E06F62"], [0x4, "0x8D1AC00050A2EA5F"], [0xAA, "0x26810E04323EEB4A"], [0x2E, "0xA4B3020F0A3ABBE1"], [0xA0, "0x5A415716A87528E0"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"], [0x17, "0x5A64BF0410E06F62"]]], [0x78, "0x31DF218FE930CC6B", []], [0x324, "0xD90EEBF06A2E2D78", [[0x17, "0x5A64BF0410E06F62"], [0x4, "0x8D1AC00050A2EA5F"], [0xAA, "0x26810E04323EEB4A"], [0x2E, "0xA4B3020F0A3ABBE1"], [0xA0, "0x5A415716A87528E0"], [0x1A, "0x4912EEE9E91F1F15"], [0x1A, "0x4912EEE9E91F1F15"], [0x17, "0x5A64BF0410E06F62"]]], [0x78, "0x31DF218FE930CC6B", []], [0x17, "0x5A64BF0410E06F62", [[0x2E, "0xA4B3020F0A3ABBE1"]]]], k = [0x4000, 0xFFFFFEEC, 0xFFFFFEEC, 0xFFFFFEEC], ret = 4, regs = []}
++XNetCreateKey = {sec = "XNET", len = 0xB, hash = "0xDAEB5566798AE2A0", deep = true, calls = [[0x11, "0x97CDFDE42251D1FB", [[0x27, "0x7DCDCDF31A21A10F"]]]], regs = []}
++XNetDnsLookup = {sec = "XNET", len = 0x17, hash = "0xB0FD90E6237C570D", calls = [[0x12D, "0x842C67FCC0488E7B", [[0x86, "0xCE61EE73B192196D"], [0x17, "0xDE7D6B93550EAC8A"], [0x32, "0x7BCA51DC9981FDB7"], [0xB6, "0x8C13CA79EC634895"], [0x115, "0xE10FB483FFDD31C5"]]]], k = [0x276D], ret = 12, regs = []}
++XNetDnsRelease = {sec = "XNET", len = 0xB, hash = "0xDAEB5566798AE2A0", deep = true, calls = [[0x11, "0x25746D186A8AB917", [[0x73, "0x15BE5C87ACA1CFA0"]]]], regs = []}
++XNetGetEthernetLinkStatus = {sec = ".text", len = 0x48, hash = "0xCABD6CA64988865A", k = [0x24C], ret = 0, regs = []}
++XNetGetTitleXnAddr = {sec = "XNET", len = 0xB, hash = "0xDAEB5566798AE2A0", calls = [[0xF, "0x548FD8B72A5FA642", [[0xF3, "0x368D96D0497F5A2A"]]]], regs = []}
++XNetInAddrToXnAddr = {}
++XNetRandom = {sec = "XNET", len = 0xB, hash = "0xDAEB5566798AE2A0", calls = [[0x1D, "0xF3A2606D1C7D508", [[0x2D, "0x79B34AE17B76716D"]]]], regs = []}
++XNetRegisterKey = {}
++XNetStartup = {}
++XNetUnregisterKey = {sec = "XNET", len = 0xB, hash = "0xDAEB5566798AE2A0", deep = true, calls = [[0x11, "0x25746D186A8AB917", [[0xC4, "0x544E75560FF65E0"]]]], regs = []}
++XNetXnAddrToInAddr = {sec = "XNET", len = 0x17, hash = "0xB0FD90E6237C570D", calls = [[0x121, "0x3FCB7A3BC421C33D", [[0x33, "0x5092EBF7C785364F"], [0x56, "0x676F801F441741E0"], [0xE6, "0x6BD8974B5E3876E4"], [0x20, "0x2F8BCE3F94F57E73"], [0x6D, "0x7A7D564F57AB3A28"]]]], k = [0x276D], ret = 12, regs = []}
++XOnlineCleanup = {}
++XOnlineStartup = {sec = "XONLINE", len = 0xEB, hash = "0xE3F4C3FF27706B1F", calls = [[0xE, "0x972EB562F739465D", [[0x52, "0x856A24D556B472D1"]]], [0x1B, "0x6DEE023884977CD6", [[0x206, "0x86ADA8B8456C7617"]]], [0x28, "0x1E9DB1E0296AC893", []], [0x28, "0x1E9DB1E0296AC893", []], [0x28, "0x1E9DB1E0296AC893", []], [0x16, "0xA1BC3FD0A7B652E6", [[0xA0, "0x5A415716A87528E0"]]], [0x16A, "0xEF9F2164434261A9", [[0x4F, "0xD845F3852AA87C98"], [0x28, "0xE09CE57A6CF748C5"], [0x4E, "0xC9B35B6A30FC87A3"], [0xFD, "0xFC5F5AD515287DC4"], [0x3D, "0x7EA8B64B236BFCD2"], [0xB7, "0x7210C7DBFE308852"], [0x173, "0x642ADF3C6EE10B58"], [0x36, "0x377893A4FA247E48"], [0xB, "0xDAEB5566798AE2A0"]]], [0x3F, "0x2FA0DBE9E9891CD5", [[0x17, "0xF0D158EB49907293"], [0x3D, "0x7EA8B64B236BFCD2"], [0x12E, "0x534538086327DB1A"], [0x1C, "0x155661E193163F53"], [0xB, "0xDAEB5566798AE2A0"]]], [0x28, "0xDC2B11F6A03DC9BA", [[0x1A, "0x4912EEE9E91F1F15"]]], [0xD, "0x7E11CA79CA95F441", [[0xD3, "0x67A3E13428F801CD"]]]], k = [0x5F8, 0xFFFF, 0x80004005, 0x80070000, 0x8007000E, 0xFFFFFE70], ret = 4, regs = []}
++_CIacos = {sec = ".text", len = 0x14, hash = "0x242CEA3CB8F35082", calls = [[0x16, "0xC97C95373548D0C1", []], [0xAE, "0xECA88B2666FCEC33", [[0x17, "0xF81CE75911DCA1F"], [0xD, "0x2C9670118DBFA776"], [0x2A, "0xFF8C47D71A6F8F0B"], [0x19, "0xE0ABAB34218B76AB"], [0xD, "0x2C9670118DBFA776"], [0x3C, "0x274B0770BF01B42F"]]]], ret = 0, regs = []}
++_CIasin = {sec = ".text", len = 0x14, hash = "0x242CEA3CB8F35082", calls = [[0x16, "0xC97C95373548D0C1", []], [0xAE, "0x67B152AC9353F8E6", [[0x17, "0xF81CE75911DCA1F"], [0xD, "0x2C9670118DBFA776"], [0x2A, "0xFF8C47D71A6F8F0B"], [0x19, "0xE0ABAB34218B76AB"], [0xD, "0x2C9670118DBFA776"], [0x3C, "0x274B0770BF01B42F"]]]], ret = 0, regs = []}
++accept = {}
++bind = {}
++closesocket = {}
++connect = {}
++crt_acos = {sec = ".text", len = 0xAE, hash = "0xECA88B2666FCEC33", calls = [[0x17, "0xF81CE75911DCA1F", []], [0xD, "0x2C9670118DBFA776", []], [0x2A, "0xFF8C47D71A6F8F0B", [[0x3C, "0x274B0770BF01B42F"]]], [0x19, "0xE0ABAB34218B76AB", []], [0xD, "0x2C9670118DBFA776", []], [0x3C, "0x274B0770BF01B42F", [[0xDD, "0xDC0DDB108AE82296"]]]], k = [0x3FF00000, 0x80000000], ret = 0, regs = ["eax"]}
++crt_asin = {sec = ".text", len = 0xAE, hash = "0x67B152AC9353F8E6", calls = [[0x17, "0xF81CE75911DCA1F", []], [0xD, "0x2C9670118DBFA776", []], [0x2A, "0xFF8C47D71A6F8F0B", [[0x3C, "0x274B0770BF01B42F"]]], [0x19, "0xE0ABAB34218B76AB", []], [0xD, "0x2C9670118DBFA776", []], [0x3C, "0x274B0770BF01B42F", [[0xDD, "0xDC0DDB108AE82296"]]]], k = [0x3FF00000, 0x80000000], ret = 0, regs = ["eax"]}
++crt_atan = {}
++crt_cos = {}
++crt_log = {}
++crt_log10 = {}
++crt_pow = {sec = ".text", len = 0x1C5, hash = "0x1FBDF1CEC7DD4478", calls = [[0x17, "0xF81CE75911DCA1F", []], [0x43, "0xC183DE6D8075AD7B", []], [0x15, "0x757C8F706D6E0101", []], [0xD, "0x2C9670118DBFA776", []], [0xA3, "0x9D93B46C954327E1", [[0x3C, "0x274B0770BF01B42F"], [0x17, "0x940B754406130E3A"]]], [0xD, "0x2C9670118DBFA776", []], [0x17, "0x940B754406130E3A", []], [0x43, "0xC183DE6D8075AD7B", []], [0x43, "0xC183DE6D8075AD7B", []], [0x152, "0x35E33A1ED25339AA", [[0x65, "0xF5EAA57EFAD8C882"]]], [0xD, "0x2C9670118DBFA776", []], [0x28, "0x6657862FD2372AE", []], [0xD, "0x2C9670118DBFA776", []], [0xD, "0x2C9670118DBFA776", []], [0xD, "0x2C9670118DBFA776", []], [0x28, "0x6657862FD2372AE", []]], k = [0x7FF00000, 0x7FF00000, 0x7FF00000, 0x7FF00000, 0x7FF00000, 0x7FFFFFFF], ret = 0, regs = ["eax"]}
++crt_sin = {}
++crt_sqrt = {}
++crt_tan = {}
++getsockname = {}
++getsockopt = {}
++ioctlsocket = {}
++listen = {}
++recv = {}
++recvfrom = {}
++select = {sec = "XNET", len = 0xF, hash = "0x7D3AA94CE644461D", calls = [[0x387, "0x619EE3FFAB531F0E", [[0x2E, "0xA4B3020F0A3ABBE1"], [0x2E, "0xA4B3020F0A3ABBE1"], [0xDE, "0x264815F33678C227"], [0xDE, "0x264815F33678C227"], [0xDE, "0x264815F33678C227"], [0x34, "0xD5693061AEFA35A4"], [0x34, "0xD5693061AEFA35A4"], [0x105, "0x3CF35DADB073CE23"], [0x105, "0x3CF35DADB073CE23"], [0x34, "0xC229F82ECD382394"], [0x2E, "0xA4B3020F0A3ABBE1"]]]], regs = []}
++send = {}
++sendto = {sec = "XNET", len = 0xF, hash = "0x7D3AA94CE644461D", calls = [[0x40, "0x82475A0B1A4CD95", [[0x113, "0x237B2E04E6686C1"]]]], regs = []}
++setsockopt = {sec = "XNET", len = 0xF, hash = "0x7D3AA94CE644461D", calls = [[0x23B, "0x28826422CBD75A5", [[0x58, "0xFA16DEBCE723F4"], [0x2E, "0xA4B3020F0A3ABBE1"], [0x34, "0xC229F82ECD382394"], [0x5C, "0xDDB312F5D4E4F1D0"], [0x34, "0xC229F82ECD382394"], [0x2E, "0xA4B3020F0A3ABBE1"]]]], regs = []}
++shutdown = {}
++socket = {}
++
++[anchors]
++DSound_StreamVtable_ref = {sec = "DSOUND", len = 0x3E, hash = "0xA9A8674737FE4985", calls = [[0x4D, "0xD9D42FA7031A2CB1", [[0x1F, "0xD1EBB22741D550CD"]]]]}
++XPP_GamepadType_ref = {sec = "XPP", len = 0x37, hash = "0x786D1AFA7B5012BB"}
++
++[data]
++D3D_DeferredTextureState = {in = "D3DDevice_SetTextureStageStateNotInline", insn = 13, op = "disp"}
++D3D_Device = {in = "D3DDevice_SetRenderState_Simple", insn = 0, op = "disp"}
++D3D_DirtyFlags = {in = "D3DDevice_SelectVertexShader", insn = 11, op = "disp"}
++D3D_FvfShader = {in = "D3DDevice_SetVertexShader", insn = 31, op = "imm"}
++D3D_IndexData = {in = "D3DDevice_SetIndices", insn = 8, op = "disp"}
++D3D_RenderState = {in = "D3DDevice_SetPixelShader", insn = 63, op = "imm"}
++D3D_SimpleRenderStateEncode = {in = "D3DDevice_SetRenderStateNotInline", insn = 4, op = "disp"}
++D3D_Streams = {in = "D3DDevice_SetStreamSource", insn = 24, op = "disp"}
++D3D_pDevice = {in = "CDevice_KickOff", insn = 10, op = "disp"}
++DSound_StreamVtable = {in = "DSound_StreamVtable_ref", insn = 6, op = "imm"}
++DSound_StreamVtable2 = {in = "DSound_StreamVtable_ref", insn = 7, op = "imm"}
++XPP_GamepadType = {in = "XPP_GamepadType_ref", insn = 2, op = "imm", deref = [0x0, 0x4]}
++XPP_MemoryUnitType = {in = "XInitDevices", insn = 9, op = "imm", deref = [0x38]}
