@@ -30,7 +30,7 @@ Work in progress. The game boots to the menu, the profile screen and the hangar,
    (This also writes the demo's `assets\XDemos\default.xbe`, which is not used and can be deleted.)
 3. Run `build.bat`.
 
-The first run downloads and patches the SDK into `sdk\` (XboxXBERecomp at the commit `patches\sdk.patch` was made against, see [patches/README.md](patches/README.md)), fetches the libraries it uses, builds the recompiler, recompiles `default.xbe` into `generated\` and compiles it. Later runs only rebuild what changed. It ends by setting up `out\run`, with the executable and a hard link to your disc image, and offers to start the game.
+The first run downloads the SDK into `sdk\` (XboxXBERecomp at the commit set in `CMakeLists.txt`; the game needs no changes to it), fetches the libraries it uses, builds the recompiler, recompiles `default.xbe` into `generated\` and compiles it. Later runs only rebuild what changed. It ends by setting up `out\run`, with the executable and a hard link to your disc image, and offers to start the game.
 
 Play with `out\run\MechAssault.exe`, not the one in `out\build\release`. The exe looks for an `assets` folder beside itself or in a parent folder; if that folder holds a `default.xbe` it treats it as extracted game files and ignores the disc image, which crashes the game. `out\run\assets` holds only the image. Settings, logs, saves and the shader cache are kept beside the exe.
 
@@ -40,22 +40,22 @@ Play with `out\run\MechAssault.exe`, not the one in `out\build\release`. The exe
 
 | Key | Action |
 |-----|--------|
-| F8 | Graphics panel: window mode, resolution, render scale, vsync, display limit, anti-aliasing, SSAO, soft shadows, shadow map size, anisotropic filtering, shader cache, an "Original rendering" switch and Defaults |
-| F9 | Controller setup |
+| F1 | The SDK's settings window (also Back + Start together on a controller): display (mode, resolution, vsync, aspect ratio, Console look), graphics (render scale, anisotropic filtering, MSAA, FXAA/SMAA, sharpening, CRT filter, frame rate cap, shader cache), audio, controller (dead zones, sensitivity, test), and Quit |
 | F10 | FPS counter |
-| F12 | Quit (also Start + Back held on a controller) |
+| F12 | Screenshot |
 
 Xbox, PlayStation and Switch controllers work, with hot plugging and rumble. Everything is saved in `settings.toml` beside the exe.
 
-MechAssault was made for 30 frames per second, so the display limit defaults to 30. The engine's clock is time-based, so the limit can be raised in the F8 panel; how the rest of the game behaves above 30 has not been checked in a mission yet.
+MechAssault was made for 30 frames per second, so the frame rate cap defaults to 30 on the first run. The engine's clock is time-based, so the cap can be raised in F1; how the rest of the game behaves above 30 has not been checked in a mission yet.
+
+The aspect ratio (F1, display; applies at the next start) is 4:3, 16:9 or "Fill the screen" for ultrawide: a 21:9 picture, with bars above and below on a 16:9 screen, and the whole screen on a 21:9 or wider one. The game's camera is widened to match (`src\game\hooks.cpp`), so a wider screen shows more of the world at the sides. The HUD and the menus are laid out for 4:3 and have not been checked on a wide screen.
 
 ## Repository layout
 
 | Folder | Content |
 |--------|---------|
-| `src\` | Host code: the F8/F9/F10/F12 screens and game hooks (`src\game\hooks.cpp`) |
+| `src\` | Host code: the FPS counter, `game_info.cpp` and the game hooks (`src\game\hooks.cpp`, the camera's aspect) |
 | `config\game.toml` | Function and data addresses found for `default.xbe`, with the hand fixes |
-| `patches\` | The changes to the SDK, as one diff and a table |
 | `docs\` | Porting notes |
 | `tools\` | Scripts to inspect `default.xbe` and the disc image, and to rebuild and run |
 

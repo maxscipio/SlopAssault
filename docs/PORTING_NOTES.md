@@ -18,7 +18,7 @@ Third port with this method (after Crimson Skies and Baldur's Gate: Dark Allianc
 
 - Repo `ma-recomp` next to the SDK; `sdk` is a junction to `..\XboxXBERecomp` (ignored by git).
 - `assets\default.xbe` (SHA-1 `682DDD1E...51777B`, the root one, not `XDemos\default.xbe`) and `assets\MechAssault.iso` (hardlink of the disc image).
-- `src\common` comes from the BGDA port (overlay F10/F12, pad mapper F9, graphics panel F8, enhance); `game_info.cpp` renamed (`ma` log prefix, `MechAssault` exe).
+- `src\common` came from the BGDA port (overlay, pad mapper, graphics panel, enhance); `game_info.cpp` renamed (`ma` log prefix, `MechAssault` exe). The F8 graphics panel, F9 pad mapper, quit dialog and `enhance` (SSAO, soft shadows, shadow size, extra edge AA) were removed for the SDK's F1 window; only the F10 FPS counter stays.
 - SDK: merged upstream `91146ff` (2 commits after `0fd0044`: point sprites as squares of the program's point size, refresh-rate cap from the monitor)
   into branch `baseline`, with the user's approval. The merge was clean. Upstream's point sprite change overlaps with the BGDA
   `oPts` patch carried in the baseline: check particles once something renders.
@@ -38,7 +38,7 @@ See `..\PORTING_GUIDE.md` section 1. `.text` 0x227460, XDK 4831 for all librarie
 | `D3DDevice_SetLight` / `LightEnable` / `SetMaterial` | 0x264C30 / 0x264E10 / 0x2642E0. The fuzzy library search missed them; found by disassembling around the device global `[0x2756A0]` (SetLight copies 0x68 bytes into the device, SetMaterial copies 0x11 dwords to device+0xAB0 and sets dirty bit 0x1000 in `[0x2756AC]`). Left at 0 they ran the guest code, which writes the pushbuffer, so the HLE renderer never saw any light or material: lit fixed-function models (mech, dropship) came out black. |
 | Other draw entry points (`DrawVerticesUP`, `SetPalette`, `SetTile`, `RunPushBuffer`, `BeginPush`, `EndPush`) | Left at 0. A fuzzy search against the 5659 `d3d8.lib` finds no candidate for any of them, so the linker did not include them. |
 | crt math (`crt_sin/cos/pow/...`) | Left at 0 (inlined x87 or unlinked). `_CIacos`/`_CIasin` resolve. Watch for NaNs. |
-| Bink (`BinkDoFrame`, `BinkGetSummary`, `BinkNextFrame`, `BinkWait`) | Left at 0, as in Crimson where movies still played. Skipping them by HLE is the fallback. |
+| Bink (`BinkDoFrame` 0x2CAA40, `BinkNextFrame` 0x2CC660, `BinkWait` 0x2CB180) | Found from the movie player's update at 0x206D90 (wait, do frame, copy to buffer, goto at the last frame, next frame) and mapped so the SDK's pacing (`xdk\bink.cpp`) holds a frame until the movie's own clock says it is due. Without it a movie steps one frame per game frame, which is 60 fps with the cap off. `BinkGetSummary` stays 0. |
 | DSOUND / XNet / WSA | Left at 0; they trap by name in the log if called. |
 
 ## 5. Build
@@ -82,3 +82,27 @@ Open items from this milestone:
 - The name entry screen showed a stray `m` in "Mech Warriorm" in one run. Input injection or a real key press; not looked into yet.
 - "audio: output starved, queueing 40 ms" appears in the log while the music streams. Check once audio is judged.
 - Particles: the baseline carries the BGDA `oPts` patch and upstream has its own point sprite change. Check when particles are on screen.
+
+## 7. Picture aspect, HUD anchoring and the CRT look
+
+The SDK now does the generic parts: F1 has the aspect setting (including ultrawide), **Console look** (4:3 at the game's own resolution) and a **CRT filter**. The port no longer registers a `gpu::Extension` (the SDK stretches the screen shaped targets for ultrawide only without one), and the old patch's own aspect picker, HUD anchoring and CRT pass are kept as `games\mechassault\own-aspect-and-crt.patch` in the SDK, to apply on top of `11e0415` if the HUD needs its anchoring. What it found:
+
+- **Hook (`src\game\hooks.cpp`):** `sub_000390F0` runs the camera's projection and, through `sub_000381B0`, its culling planes; both read the rectangle `[cam+0x9C] / [cam+0xA0]`. The hook widens the width by `max(1, app::Aspect() * 0.75)` and the horizontal field at `[cam+0x88]` by the same factor (the vertical field is that divided by the aspect) while the original runs, and restores them. `0x381B0` has no other caller. The same function sets the device viewport from the rectangle through `sub_00037D80`; a second hook keeps that at 640 wide, as the renderer stretches the viewport across the screen.
+- **Ultrawide:** `OnInit` in `game_info.cpp` sets `app::g_aspect` to 21:9 when the aspect setting is "Fill the screen" and the output is narrower, so a 16:9 screen gets bars above and below. On a 21:9 or wider output it is left unset and the SDK fills the screen.
+- The game renders a fixed 640 x 480 with a 4:3 projection (focal 496 px; the matrix comes from the camera method at `0x390F0` through `SetTransform(1)`, m00 / m11 = 0.75).
+  The patch leaves the projection alone: `ShadowHooks::Position()` squeezes clip space about the centre by `4/3 / aspect` and the stretch to the window widens it, so a 16:9 or 21:9 window shows more world at the sides (Hor+) with the vertical field unchanged.
+- The HUD is drawn pretransformed (FVF with rhw, vs handle `0x144` / `0x44`), in raw 640 x 480 pixels. `Anchor()` classifies each box: at least 0.85 of the width = full screen (cover), ending in the left 42 % = left corner (radar), starting in the right 42 % = right corner (health, ammo), anything else is centred (crosshair). A pretransformed vertex has `w = 1 / rhw = 1`, which is how the hook tells a 2D quad from the world.
+- Culling: the camera builds its frustum planes in `0x381B0` (perspective) from the 4:3 rectangle at `[cam+0x9C]`. The patch's override widens that width by `aspect * 0.75` while the planes are built, then restores it; without it objects at the sides pop out of view.
+- Original rendering: the patch's CRT pass was promoted to the SDK (`crt`, `crt_scanlines`, `crt_softness`, `crt_mask`, `crt_curve` in `settings.toml`).
+- Not checked: the HUD, menus, loading screens and movies at 16:9 and 21:9 with the hook above (the HUD is 4:3 and the SDK squeezes 2D into a centred 16:9 part), and the 3D at the sides.
+
+## 8. Flickering dark and light wedges on the road
+
+Symptom: hard edged, triangle shaped dark and light patches on the road and ground that changed with the camera and the mech, on D3D12 and Vulkan, at any aspect. Not seen on the console.
+
+- **Pass:** each frame draws the static 256 x 256 lightmap (texture `837CE000`, world XZ over 2048 units, building and cliff shadows) into a render target, the terrain's pixel shader samples it, and the road pieces are then redrawn with vertex shaders `B0906E61` and its variants. Those draws multiply the lightmap in (blend DESTCOLOR * ZERO, fixed function pixel stage, stencil GEQUAL 1 / DECR_WRAP so each pixel is modulated once, depth LEQUAL with no depth write).
+- **Cause:** the redraw tests LEQUAL against the depth the first road pass wrote through another transform (fixed function against the game's own matrix), so the depths differ in the last bits. The console's 24 bit depth buffer absorbs that; the host's reversed float depth does not, so the multiply failed per pixel in patches that follow the triangles.
+- **Bisect:** skipping vertex shader `B0906E61` removed the near patches; disabling its stencil did not; disabling its depth test removed them; a depth offset toward the camera did. Ruled out: the stencil shadow volumes (`B0906441`), depth clip, the unit texcoord clamp heuristic, the lightmap contents and the upstream merge.
+- **Fix (SDK `d7bb693`):** a depth tested LEQUAL draw with no depth write moves 64 console depth steps toward the camera (`kRedrawDepthSteps`, `FillDepthConstants` in both `d3d12.cpp` and `vulkan.cpp`; z buffers only). 512 host depth ULPs fixed the near patches but not the far ones; 64 console steps fixed both. A toward the camera offset also now stops at the near plane (`ReversedClip` in `shaders.cpp`): without it the menu, whose quads sit at the near plane, was clipped away and drawn black.
+- **Tried, no effect:** xemu's fix for this game's shadow at certain angles (PR #3056, clear handling of the X1A7R8G8B8 formats) is a clear on the NV2A register level and has no counterpart in the SDK's clears.
+- **Debug aids that found it:** `XBE_CAPTURE_DIR` / `XBE_CAPTURE_EVERY` frame captures (`frame.txt` lists the draws with their vertex shader handle, state and stencil), and temporary hooks skipping a draw by vertex shader handle or changing its state, read from a text file every few frames. Give such a file an absolute path: the game is often launched from somewhere else.

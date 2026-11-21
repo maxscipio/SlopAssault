@@ -7,9 +7,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # the SDK: sdk/ here (a checkout, or a junction to your own), two folders up inside the SDK's templates, else cloned
-# into sdk/ at the commit patches/sdk.patch was made against, with the patch applied
-set(SDK_REPOSITORY https://github.com/TGP482/XboxXBERecomp.git)
-set(SDK_COMMIT 91146ff)
+# into sdk/ at the commit of the SDK's ref branch this was built against; the SDK needs no changes for this game
+set(SDK_REPOSITORY https://github.com/maxscipio/XboxXBERecomp.git)
+set(SDK_COMMIT d7bb693)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sdk/cmake/XbeRecomp.cmake)
     set(SDK ${CMAKE_CURRENT_SOURCE_DIR}/sdk)
 elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/XbeRecomp.cmake)
@@ -18,11 +18,9 @@ else()
     find_package(Git REQUIRED)
     set(SDK ${CMAKE_CURRENT_SOURCE_DIR}/sdk)
     message(STATUS "Cloning the SDK ${SDK_REPOSITORY} at ${SDK_COMMIT}")
-    # an LF checkout: the line endings the patch was made against
     foreach(STEP
-            "clone;--quiet;-c;core.autocrlf=false;-c;core.eol=lf;${SDK_REPOSITORY};${SDK}"
-            "-C;${SDK};checkout;--quiet;${SDK_COMMIT}"
-            "-C;${SDK};apply;${CMAKE_CURRENT_SOURCE_DIR}/patches/sdk.patch")
+            "clone;--quiet;${SDK_REPOSITORY};${SDK}"
+            "-C;${SDK};checkout;--quiet;${SDK_COMMIT}")
         execute_process(COMMAND ${GIT_EXECUTABLE} ${STEP} RESULT_VARIABLE RESULT)
         if(NOT RESULT EQUAL 0)
             file(REMOVE_RECURSE ${SDK})
@@ -34,9 +32,6 @@ include(${SDK}/cmake/XbeRecomp.cmake)
 
 file(GLOB XBE_HOST_SOURCES CONFIGURE_DEPENDS src/*/*.cpp)
 list(FILTER XBE_HOST_SOURCES EXCLUDE REGEX "/src/game/")
-# the controller setup screen reads SDL directly (the SDK gives SDL's headers to its input code only)
-set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/common/pad_mapping.cpp
-    PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
 
 # partitions as xbe_symbols wrote them into config/game.toml
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS config/game.toml)
