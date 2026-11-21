@@ -94,7 +94,7 @@ The SDK now does the generic parts: F1 has the aspect setting (including ultrawi
 - The HUD is drawn pretransformed (FVF with rhw, vs handle `0x144` / `0x44`), in raw 640 x 480 pixels. `Anchor()` classifies each box: at least 0.85 of the width = full screen (cover), ending in the left 42 % = left corner (radar), starting in the right 42 % = right corner (health, ammo), anything else is centred (crosshair). A pretransformed vertex has `w = 1 / rhw = 1`, which is how the hook tells a 2D quad from the world.
 - Culling: the camera builds its frustum planes in `0x381B0` (perspective) from the 4:3 rectangle at `[cam+0x9C]`. The patch's override widens that width by `aspect * 0.75` while the planes are built, then restores it; without it objects at the sides pop out of view.
 - Original rendering: the patch's CRT pass was promoted to the SDK (`crt`, `crt_scanlines`, `crt_softness`, `crt_mask`, `crt_curve` in `settings.toml`).
-- Not checked: the HUD, menus, loading screens and movies at 16:9 and 21:9 with the hook above (the HUD is 4:3 and the SDK squeezes 2D into a centred 16:9 part), and the 3D at the sides.
+- Checked in game: the Bink movies play at their own pace, and the HUD and menus are fine at 4:3, 16:9 and 21:9 with the hook above.
 
 ## 8. Flickering dark and light wedges on the road
 
